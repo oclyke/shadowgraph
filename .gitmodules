@@ -1,0 +1,3 @@
+[submodule "third-party/github.com/espressif/esp-idf"]
+	path = third-party/github.com/espressif/esp-idf
+	url = https://github.com/espressif/esp-idf.git
