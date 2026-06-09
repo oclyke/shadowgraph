@@ -1,3 +1,9 @@
 [submodule "third-party/github.com/espressif/esp-idf"]
 	path = third-party/github.com/espressif/esp-idf
 	url = https://github.com/espressif/esp-idf.git
+[submodule "third-party/github.com/oclyke/driver-DAC8871"]
+	path = third-party/github.com/oclyke/driver-DAC8871
+	url = https://github.com/oclyke/driver-DAC8871.git
+[submodule "third-party/github.com/oclyke/driver-DACx0004"]
+	path = third-party/github.com/oclyke/driver-DACx0004
+	url = https://github.com/oclyke/driver-DACx0004.git
