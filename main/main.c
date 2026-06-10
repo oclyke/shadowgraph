@@ -106,12 +106,93 @@ void app_main(void)
     // -- DAC devices ---------------------------------------------------------
     ESP_ERROR_CHECK(dac8871_init_dev(&galvo_x, &dac8871_if_idf6, &galvo_x_arg) == DAC8871_STAT_OK ? ESP_OK : ESP_FAIL);
     ESP_ERROR_CHECK(dac8871_init_dev(&galvo_y, &dac8871_if_idf6, &galvo_y_arg) == DAC8871_STAT_OK ? ESP_OK : ESP_FAIL);
+    // Force both devices onto the shared SPI bus before any sweep so neither
+    // CS floats during the other device's first transaction (lazy-init race).
+    dac8871_set_code(&galvo_x, 0x8000);
+    dac8871_set_code(&galvo_y, 0x8000);
     ESP_ERROR_CHECK(dacx0004_init_dev(&laser, DAC80004, &dacx0004_if_idf6, &laser_arg) == DACX0004_STAT_OK ? ESP_OK : ESP_FAIL);
 
     ESP_LOGI(TAG, "galvo X, galvo Y, and laser DAC initialised");
 
+    ESP_ERROR_CHECK(dacx0004_write_update_channel(&laser, LASER_CH_RED,   0x0000) == DACX0004_STAT_OK ? ESP_OK : ESP_FAIL);
+    ESP_ERROR_CHECK(dacx0004_write_update_channel(&laser, LASER_CH_GREEN, 0x0000) == DACX0004_STAT_OK ? ESP_OK : ESP_FAIL);
+    ESP_ERROR_CHECK(dacx0004_write_update_channel(&laser, LASER_CH_BLUE,  0x0000) == DACX0004_STAT_OK ? ESP_OK : ESP_FAIL);
+    ESP_LOGI(TAG, "laser red ramping");
+
+    // Ramp red 0 -> 25% -> 0, 50 steps each way at 10 ms/step = 1 second per cycle
+    // 10 ms = 1 tick at CONFIG_FREERTOS_HZ=100; smaller delays truncate to 0
+    #define LASER_MAX  0xFFFF
+    #define RAMP_STEPS 50
+    #define STEP_MS    10
+
     while (1) {
-        ESP_LOGI(TAG, "Hello, World!");
-        vTaskDelay(pdMS_TO_TICKS(1000));
+
+    
+    #define TEST_RED_RAMP 0
+    #define TEST_GREEN_RAMP 0
+    #define TEST_BLUE_RAMP 0
+    #define TEST_GALVO_SWEEP 1
+
+    #if TEST_RED_RAMP
+        for (int i = 0; i <= RAMP_STEPS; i++) {
+            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
+            dacx0004_write_update_channel(&laser, LASER_CH_BLUE, val);
+            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
+        }
+        for (int i = RAMP_STEPS; i >= 0; i--) {
+            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
+            dacx0004_write_update_channel(&laser, LASER_CH_BLUE, val);
+            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
+        }
+    #endif
+
+    #if TEST_GREEN_RAMP
+        for (int i = 0; i <= RAMP_STEPS; i++) {
+            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
+            dacx0004_write_update_channel(&laser, LASER_CH_GREEN, val);
+            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
+        }
+        for (int i = RAMP_STEPS; i >= 0; i--) {
+            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
+            dacx0004_write_update_channel(&laser, LASER_CH_GREEN, val);
+            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
+        }
+    #endif
+
+    #if TEST_BLUE_RAMP
+        for (int i = 0; i <= RAMP_STEPS; i++) {
+            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
+            dacx0004_write_update_channel(&laser, LASER_CH_BLUE, val);
+            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
+        }
+        for (int i = RAMP_STEPS; i >= 0; i--) {
+            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
+            dacx0004_write_update_channel(&laser, LASER_CH_BLUE, val);
+            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
+        }
+    #endif
+
+    #if TEST_GALVO_SWEEP
+        for (int i = 0; i <= RAMP_STEPS; i++) {
+            uint16_t val = (uint16_t)((uint32_t)0xFFFF * i / RAMP_STEPS);
+
+            for (int repeat = 0; repeat < 5; repeat++) {
+                dac8871_set_code(&galvo_x, val);
+                dac8871_set_code(&galvo_y, val);
+                dac8871_latch(&galvo_x);
+                dac8871_latch(&galvo_y);
+                vTaskDelay(pdMS_TO_TICKS(STEP_MS));
+            }
+        }
+        for (int i = RAMP_STEPS; i >= 0; i--) {
+            uint16_t val = (uint16_t)((uint32_t)0xFFFF * i / RAMP_STEPS);
+            dac8871_set_code(&galvo_x, val);
+            dac8871_set_code(&galvo_y, val);
+            dac8871_latch(&galvo_x);
+            dac8871_latch(&galvo_y);
+            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
+        }
+    #endif
+
     }
 }
