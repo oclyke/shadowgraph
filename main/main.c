@@ -1,7 +1,7 @@
-// shadowgraph demo: park the beam at center and cycle its color through the
-// HSV hue wheel. This exercises the full laser_engine path end to end (queue,
-// command codec, timer-paced consumer, galvo + laser DAC writes) with the
-// simplest possible renderer, before moving on to motion patterns.
+// shadowgraph demo: trace a morphing Lissajous "ballywhoop" on the galvos while
+// slowly cycling the laser color through the HSV hue wheel at 25% intensity.
+// Exercises the full laser_engine path end to end: queue, command codec,
+// timer-paced consumer, and galvo + laser DAC writes.
 #include <math.h>
 
 #include "freertos/FreeRTOS.h"
@@ -53,9 +53,26 @@ static const char *TAG = "shadowgraph";
 // ---------------------------------------------------------------------------
 // Demo parameters
 // ---------------------------------------------------------------------------
-#define GALVO_CENTER     0x8000     // mid-scale = zero deflection
-#define HUE_STEPS        360        // color samples per full revolution
-#define STEP_DWELL_US    20000      // 20 ms per hue -> ~7.2 s per full cycle
+#define GALVO_CENTER      0x8000    // mid-scale = zero deflection
+
+// Stay within +/-20% of full-scale travel to keep the galvos in their linear
+// region: 0.20 * 0xFFFF ~= 13107.
+#define GALVO_AMPLITUDE   13107
+
+// "Ballywhoop": a 3:2 Lissajous figure whose y-axis phase precesses slowly, so
+// the figure continuously morphs.
+#define LISSAJOUS_FX      3.0f
+#define LISSAJOUS_FY      2.0f
+#define POINTS_PER_LOOP   256
+#define POINT_DWELL_US    2000      // 2 ms/point -> ~0.5 s per base loop
+#define PHASE_STEP        0.002f    // y-phase precession per point (radians)
+
+#define HUE_STEP          0.1f      // degrees/point -> ~7.2 s per color cycle
+#define LASER_INTENSITY   0.25f     // 25% of full scale
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 // ---------------------------------------------------------------------------
 // Device handles + interface args
@@ -98,7 +115,7 @@ static dacx0004_idf6_arg_t laser_arg = {
 // ---------------------------------------------------------------------------
 static void hsv_to_rgb16(float h, uint16_t *r, uint16_t *g, uint16_t *b)
 {
-    const float c  = 1.0f;   // chroma = V * S
+    const float c  = LASER_INTENSITY;   // chroma = V * S  (V = LASER_INTENSITY, S = 1)
     const float hp = h / 60.0f;
     const float x  = c * (1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f));
     float rf = 0.0f, gf = 0.0f, bf = 0.0f;
@@ -116,26 +133,34 @@ static void hsv_to_rgb16(float h, uint16_t *r, uint16_t *g, uint16_t *b)
 }
 
 // ---------------------------------------------------------------------------
-// Renderer: park the beam once, then walk the hue wheel forever. Producer-side
-// calls retry on a full queue (the consumer drains at the dwell rate).
+// Renderer: trace a morphing Lissajous ("ballywhoop") while slowly cycling the
+// hue. Each point is goto + color + dwell; producer-side calls retry on a full
+// queue (the consumer drains at the dwell rate).
 // ---------------------------------------------------------------------------
 static void render_task(void *arg)
 {
     (void)arg;
 
-    while (!laser_engine_goto(GALVO_CENTER, GALVO_CENTER)) {
-        vTaskDelay(1);
-    }
+    const float two_pi = (float)(2.0 * M_PI);
+    const float t_step = two_pi / POINTS_PER_LOOP;
+    float t = 0.0f, phase = 0.0f, hue = 0.0f;
 
-    float hue = 0.0f;
     for (;;) {
+        int32_t x = GALVO_CENTER + (int32_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FX * t));
+        int32_t y = GALVO_CENTER + (int32_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FY * t + phase));
+
         uint16_t r, g, b;
         hsv_to_rgb16(hue, &r, &g, &b);
 
-        while (!laser_engine_laser(r, g, b))        { vTaskDelay(1); }
-        while (!laser_engine_dwell(STEP_DWELL_US))  { vTaskDelay(1); }
+        while (!laser_engine_goto((uint16_t)x, (uint16_t)y)) { vTaskDelay(1); }
+        while (!laser_engine_laser(r, g, b))                 { vTaskDelay(1); }
+        while (!laser_engine_dwell(POINT_DWELL_US))          { vTaskDelay(1); }
 
-        hue += 360.0f / HUE_STEPS;
+        t += t_step;
+        if (t >= two_pi) t -= two_pi;
+        phase += PHASE_STEP;
+        if (phase >= two_pi) phase -= two_pi;
+        hue += HUE_STEP;
         if (hue >= 360.0f) hue -= 360.0f;
     }
 }
@@ -191,7 +216,7 @@ void app_main(void)
         ESP_LOGE(TAG, "laser_engine_init failed"); return;
     }
     laser_engine_start();
-    ESP_LOGI(TAG, "laser engine started; cycling HSV at center");
+    ESP_LOGI(TAG, "laser engine started; tracing ballywhoop at 25%% intensity");
 
     // Renderer on core 0 (the consumer owns core 1).
     xTaskCreatePinnedToCore(render_task, "render", 4096, NULL, 5, NULL, 0);
