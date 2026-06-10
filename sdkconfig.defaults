@@ -1,1 +1,13 @@
 CONFIG_IDF_TARGET="esp32"
+
+# Laser engine: the gptimer alarm callback is the SPI consumer and must keep
+# running even while the flash cache is disabled (e.g. during a flash write), so
+# the whole ISR path lives in IRAM and touches no flash.
+#   - GPTIMER_ISR_IRAM_SAFE  : place the gptimer ISR in IRAM, cache-safe.
+#   - GPTIMER_CTRL_FUNC_IN_IRAM : gptimer_get_raw_count / gptimer_set_alarm_action
+#                                 (used inside the callback) become IRAM-safe.
+#   - SPI_MASTER_ISR_IN_IRAM : keeps spi_hal_iram.c (the transaction functions
+#                              isr_spi calls) mapped into IRAM.
+CONFIG_GPTIMER_ISR_IRAM_SAFE=y
+CONFIG_GPTIMER_CTRL_FUNC_IN_IRAM=y
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y

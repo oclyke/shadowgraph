@@ -1,11 +1,20 @@
 #include "laser_command.h"
 
+// laser_command_pop (and its helper laser_command_size) run in the laser_engine
+// timer ISR, which is IRAM-safe; keep them out of flash. push_* are producer-
+// side (renderer task) and stay in flash. No-op on the host test build.
+#if defined(ESP_PLATFORM)
+#include "esp_attr.h"
+#else
+#define IRAM_ATTR
+#endif
+
 #define REC_GOTO   (1 + 2 + 2)       // type + x + y
 #define REC_LASER  (1 + 2 + 2 + 2)   // type + r + g + b
 #define REC_DWELL  (1 + 4)           // type + dt
 #define REC_MAX    REC_LASER
 
-uint32_t laser_command_size(laser_command_type_t type) {
+uint32_t IRAM_ATTR laser_command_size(laser_command_type_t type) {
     switch (type) {
         case LASER_CMD_GOTO:  return REC_GOTO;
         case LASER_CMD_LASER: return REC_LASER;
@@ -56,7 +65,7 @@ bool laser_command_push_dwell(byte_queue_t *q, uint32_t dt) {
     return byte_queue_write(q, rec, sizeof rec);
 }
 
-bool laser_command_pop(byte_queue_t *q, laser_command_t *out) {
+bool IRAM_ATTR laser_command_pop(byte_queue_t *q, laser_command_t *out) {
     uint8_t type;
     if (byte_queue_peek(q, &type, 1) < 1) {
         return false;   // empty

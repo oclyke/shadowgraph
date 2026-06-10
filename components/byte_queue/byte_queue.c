@@ -3,6 +3,15 @@
 #include <stdatomic.h>
 #include <string.h>
 
+// The consumer side (avail/read/peek/copy_out) runs inside the laser_engine
+// timer ISR, which is IRAM-safe, so those functions must live in IRAM and touch
+// no flash. On the host (unit tests) IRAM_ATTR is a no-op.
+#if defined(ESP_PLATFORM)
+#include "esp_attr.h"
+#else
+#define IRAM_ATTR
+#endif
+
 static inline bool is_pow2(uint32_t x) {
     return x != 0 && (x & (x - 1)) == 0;
 }
@@ -26,7 +35,7 @@ uint32_t byte_queue_free(byte_queue_t *q) {
     return (q->mask + 1) - (head - tail);
 }
 
-uint32_t byte_queue_avail(byte_queue_t *q) {
+uint32_t IRAM_ATTR byte_queue_avail(byte_queue_t *q) {
     uint32_t head = atomic_load_explicit(&q->head, memory_order_acquire);
     uint32_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
     return head - tail;
@@ -54,7 +63,7 @@ bool byte_queue_write(byte_queue_t *q, const void *src, uint32_t n) {
 }
 
 // Copy n bytes starting at read offset `tail` (handles wrap). Does not advance.
-static void copy_out(byte_queue_t *q, uint32_t tail, void *dst, uint32_t n) {
+static void IRAM_ATTR copy_out(byte_queue_t *q, uint32_t tail, void *dst, uint32_t n) {
     uint32_t cap   = q->mask + 1;
     uint32_t off   = tail & q->mask;
     uint32_t first = cap - off;
@@ -67,7 +76,7 @@ static void copy_out(byte_queue_t *q, uint32_t tail, void *dst, uint32_t n) {
     }
 }
 
-uint32_t byte_queue_read(byte_queue_t *q, void *dst, uint32_t n) {
+uint32_t IRAM_ATTR byte_queue_read(byte_queue_t *q, void *dst, uint32_t n) {
     uint32_t head  = atomic_load_explicit(&q->head, memory_order_acquire);
     uint32_t tail  = atomic_load_explicit(&q->tail, memory_order_relaxed);
     uint32_t avail = head - tail;
@@ -77,7 +86,7 @@ uint32_t byte_queue_read(byte_queue_t *q, void *dst, uint32_t n) {
     return n;
 }
 
-uint32_t byte_queue_peek(byte_queue_t *q, void *dst, uint32_t n) {
+uint32_t IRAM_ATTR byte_queue_peek(byte_queue_t *q, void *dst, uint32_t n) {
     uint32_t head  = atomic_load_explicit(&q->head, memory_order_acquire);
     uint32_t tail  = atomic_load_explicit(&q->tail, memory_order_relaxed);
     uint32_t avail = head - tail;

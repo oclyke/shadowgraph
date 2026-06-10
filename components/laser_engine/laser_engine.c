@@ -2,46 +2,84 @@
 #include "byte_queue.h"
 #include "laser_command.h"
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "driver/gptimer.h"
-#include "esp_log.h"
+#include "esp_attr.h"
 
 #define LASER_Q_CAP    4096u       // power of two
 #define TIMER_HZ       1000000u    // 1 tick = 1 us
 #define MIN_LEAD_TICKS 4u          // don't arm an alarm closer than this many ticks
 
-static const char *TAG = "laser_engine";
-
+// Internal-RAM queue backing store: the consumer reads it from an IRAM-safe ISR,
+// so it must not live in (cached) flash. Static .bss is internal DRAM.
 static uint8_t            s_qbuf[LASER_Q_CAP];
 static byte_queue_t       s_q;
 static laser_engine_cfg_t s_cfg;
 static gptimer_handle_t   s_timer;
-static TaskHandle_t       s_task;
 static uint64_t           s_next_deadline;   // intended fire time, in timer ticks
+static volatile uint32_t  s_corrupt_count;   // bumped in ISR; inspect from a task
 
 // ---------------------------------------------------------------------------
-// Timer ISR: only wakes the output task. SPI happens in task context because
-// the IDF SPI master driver is not ISR-safe.
+// DAC wire encoders (build the exact bytes the drivers would send, inline, so
+// the ISR never calls the flash-resident, blocking driver cores).
 // ---------------------------------------------------------------------------
-static bool IRAM_ATTR on_alarm(gptimer_handle_t timer,
-                               const gptimer_alarm_event_data_t *edata,
-                               void *user_ctx)
+
+// DAC8871: 16-bit code, MSB first.
+static inline void IRAM_ATTR galvo_write(isr_spi_dev_t *d, uint16_t code)
 {
-    (void)timer; (void)edata; (void)user_ctx;
-    BaseType_t woken = pdFALSE;
-    vTaskNotifyGiveFromISR(s_task, &woken);
-    return woken == pdTRUE;
+    uint8_t b[2] = { (uint8_t)(code >> 8), (uint8_t)code };
+    isr_spi_write(d, b, 16);
 }
 
-static inline uint64_t now_ticks(void)
+// DAC80004 WRITEn_UPDATEn: 32-bit frame {Rw=0, cmd, add, dat[16], mod=0}.
+// Byte layout mirrors the DACx0004 driver's DAT0..DAT3 packing.
+static inline void IRAM_ATTR laser_write_ch(dacx0004_add_e ch, uint16_t v)
+{
+    uint8_t b[4] = {
+        (uint8_t)DACX0004_CMD_WRITEn_UPDATEn,            // Rw=0 | cmd
+        (uint8_t)(((uint8_t)ch << 4) | (v >> 12)),       // add | dat[15:12]
+        (uint8_t)(v >> 4),                               // dat[11:4]
+        (uint8_t)(v << 4),                               // dat[3:0] | mod=0
+    };
+    isr_spi_write(s_cfg.laser, b, 32);
+}
+
+static void IRAM_ATTR blank_laser(void)
+{
+    laser_write_ch(s_cfg.ch_r, 0);
+    laser_write_ch(s_cfg.ch_g, 0);
+    laser_write_ch(s_cfg.ch_b, 0);
+}
+
+static void IRAM_ATTR dispatch(const laser_command_t *c)
+{
+    switch (c->type) {
+        case LASER_CMD_GOTO:
+            // LDAC is held low (transparent latch), so the outputs update on
+            // write; X then Y land within ~a couple of us of each other.
+            galvo_write(s_cfg.galvo_x, c->pos.x);
+            galvo_write(s_cfg.galvo_y, c->pos.y);
+            break;
+        case LASER_CMD_LASER:
+            laser_write_ch(s_cfg.ch_r, c->col.r);
+            laser_write_ch(s_cfg.ch_g, c->col.g);
+            laser_write_ch(s_cfg.ch_b, c->col.b);
+            break;
+        default:
+            break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Timer helpers (IRAM under CONFIG_GPTIMER_CTRL_FUNC_IN_IRAM).
+// ---------------------------------------------------------------------------
+static inline uint64_t IRAM_ATTR now_ticks(void)
 {
     uint64_t c = 0;
     gptimer_get_raw_count(s_timer, &c);
     return c;
 }
 
-static void arm_at(uint64_t deadline)
+static void IRAM_ATTR arm_at(uint64_t deadline)
 {
     gptimer_alarm_config_t alarm = {
         .alarm_count                = deadline,
@@ -51,15 +89,8 @@ static void arm_at(uint64_t deadline)
     gptimer_set_alarm_action(s_timer, &alarm);
 }
 
-static void blank_laser(void)
-{
-    dacx0004_write_update_channel(s_cfg.laser, s_cfg.ch_r, 0);
-    dacx0004_write_update_channel(s_cfg.laser, s_cfg.ch_g, 0);
-    dacx0004_write_update_channel(s_cfg.laser, s_cfg.ch_b, 0);
-}
-
 // Consumer-side flush (safe: the consumer owns the read cursor).
-static void flush_q(void)
+static void IRAM_ATTR flush_q(void)
 {
     uint8_t scratch[32];
     while (byte_queue_avail(&s_q) > 0) {
@@ -67,28 +98,9 @@ static void flush_q(void)
     }
 }
 
-static void dispatch(const laser_command_t *c)
-{
-    switch (c->type) {
-        case LASER_CMD_GOTO:
-            // LDAC is held low (transparent latch), so the output updates on
-            // write; X then Y land within ~a couple of us of each other.
-            dac8871_set_code(s_cfg.galvo_x, c->pos.x);
-            dac8871_set_code(s_cfg.galvo_y, c->pos.y);
-            break;
-        case LASER_CMD_LASER:
-            dacx0004_write_update_channel(s_cfg.laser, s_cfg.ch_r, c->col.r);
-            dacx0004_write_update_channel(s_cfg.laser, s_cfg.ch_g, c->col.g);
-            dacx0004_write_update_channel(s_cfg.laser, s_cfg.ch_b, c->col.b);
-            break;
-        default:
-            break;
-    }
-}
-
 // Process instantaneous commands back-to-back; on DWELL arm the timer and
-// return; on empty blank the laser and re-arm a short retry.
-static void drain(void)
+// return; on empty blank the laser and re-arm a short retry. Runs in the ISR.
+static void IRAM_ATTR drain(void)
 {
     for (;;) {
         uint8_t type;
@@ -125,21 +137,25 @@ static void drain(void)
 
 corrupt:
     // Unknown/partial record (should be impossible with atomic push). Flush and
-    // blank for safety, then wait for the next wake.
-    ESP_LOGW(TAG, "corrupt queue record; flushing");
+    // blank for safety, then wait for the next wake. No logging from the ISR;
+    // a task can watch s_corrupt_count.
+    s_corrupt_count++;
     flush_q();
     blank_laser();
     s_next_deadline = now_ticks() + s_cfg.retry_us;
     arm_at(s_next_deadline);
 }
 
-static void output_task(void *arg)
+// Timer ISR: the consumer itself. Drains the queue and drives the DACs directly
+// (isr_spi is IRAM-safe and polled), then re-arms for the next dwell. Nothing to
+// wake, so no higher-priority task is unblocked.
+static bool IRAM_ATTR on_alarm(gptimer_handle_t timer,
+                               const gptimer_alarm_event_data_t *edata,
+                               void *user_ctx)
 {
-    (void)arg;
-    for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        drain();
-    }
+    (void)timer; (void)edata; (void)user_ctx;
+    drain();
+    return false;
 }
 
 bool laser_engine_init(const laser_engine_cfg_t *cfg)
@@ -149,8 +165,7 @@ bool laser_engine_init(const laser_engine_cfg_t *cfg)
         return false;
     }
     s_cfg = *cfg;
-    if (s_cfg.retry_us == 0)  s_cfg.retry_us  = 1000;
-    if (s_cfg.task_prio == 0) s_cfg.task_prio = configMAX_PRIORITIES - 1;
+    if (s_cfg.retry_us == 0) s_cfg.retry_us = 1000;
 
     if (!byte_queue_init(&s_q, s_qbuf, LASER_Q_CAP)) {
         return false;
@@ -167,28 +182,23 @@ bool laser_engine_init(const laser_engine_cfg_t *cfg)
     if (gptimer_register_event_callbacks(s_timer, &cbs, NULL) != ESP_OK) return false;
     if (gptimer_enable(s_timer) != ESP_OK) return false;
 
-    BaseType_t ok;
-    if (s_cfg.task_core < 0) {
-        ok = xTaskCreate(output_task, "laser_out", 4096, NULL,
-                         s_cfg.task_prio, &s_task);
-    } else {
-        ok = xTaskCreatePinnedToCore(output_task, "laser_out", 4096, NULL,
-                                     s_cfg.task_prio, &s_task, s_cfg.task_core);
-    }
-    return ok == pdPASS;
+    return true;
 }
 
 void laser_engine_start(void)
 {
-    // Prime the DACs (forces the drivers' lazy spi_bus_add_device off the hot
-    // path) and put the hardware in a known, safe state.
-    dac8871_set_code(s_cfg.galvo_x, 0x8000);
-    dac8871_set_code(s_cfg.galvo_y, 0x8000);
+    // Put the hardware in a known, safe state. isr_spi works in task context
+    // too, so this one-time bring-up is fine here.
+    galvo_write(s_cfg.galvo_x, 0x8000);   // mid-scale = zero deflection
+    galvo_write(s_cfg.galvo_y, 0x8000);
     blank_laser();
 
     gptimer_start(s_timer);
     s_next_deadline = now_ticks();
-    xTaskNotifyGive(s_task);   // kick the first drain
+
+    // Kick off the first drain from the ISR (not here) so the consumer only ever
+    // runs in one context — no task/ISR reentrancy on the queue or schedule.
+    arm_at(now_ticks() + MIN_LEAD_TICKS);
 }
 
 bool laser_engine_goto(uint16_t x, uint16_t y) {

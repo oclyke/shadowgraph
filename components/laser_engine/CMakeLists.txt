@@ -6,8 +6,7 @@ idf_component_register(
     REQUIRES
         byte_queue
         laser_command
-        driver_dac8871
-        driver_dacx0004
+        isr_spi             # ISR-safe SPI writer (public: in laser_engine.h)
+        driver_dacx0004     # DACX0004 command/channel enums used by the encoder
         esp_driver_gptimer
-        esp_driver_spi
 )
