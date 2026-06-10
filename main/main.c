@@ -12,6 +12,7 @@
 #include "dac8871_idf6.h"
 #include "dacx0004_idf6.h"
 #include "laser_engine.h"
+#include "wifi_ap.h"
 
 static const char *TAG = "shadowgraph";
 
@@ -180,6 +181,12 @@ static void render_task(void *arg)
 
 void app_main(void)
 {
+    // -- Networking: bring up the SoftAP for streaming. Owns NVS / netif /
+    //    event loop, so start it first. --------------------------------------
+    if (!wifi_ap_start()) {
+        ESP_LOGE(TAG, "wifi_ap_start failed");  // non-fatal: keep tracing
+    }
+
     // -- SPI buses (one per DAC group) --------------------------------------
     spi_bus_config_t galvo_bus = {
         .mosi_io_num     = GALVO_PIN_MOSI,
