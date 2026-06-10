@@ -41,28 +41,84 @@ static inline uint32_t get_u32(const uint8_t *p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+uint32_t laser_command_encode(uint8_t *dst, uint32_t cap, const laser_command_t *c) {
+    uint32_t size = laser_command_size(c->type);
+    if (size == 0 || cap < size) {
+        return 0;   // unknown type or not enough room — leave dst untouched
+    }
+    dst[0] = (uint8_t)c->type;
+    switch (c->type) {
+        case LASER_CMD_GOTO:
+            put_u16(dst + 1, c->pos.x);
+            put_u16(dst + 3, c->pos.y);
+            break;
+        case LASER_CMD_LASER:
+            put_u16(dst + 1, c->col.r);
+            put_u16(dst + 3, c->col.g);
+            put_u16(dst + 5, c->col.b);
+            break;
+        case LASER_CMD_DWELL:
+            put_u32(dst + 1, c->dwell.dt);
+            break;
+        default:
+            return 0;   // unreachable (guarded by size above)
+    }
+    return size;
+}
+
+bool laser_command_decode(const uint8_t *src, uint32_t len,
+                          laser_command_t *out, uint32_t *consumed) {
+    if (len < 1) {
+        return false;
+    }
+    uint32_t size = laser_command_size((laser_command_type_t)src[0]);
+    if (size == 0 || len < size) {
+        return false;   // unknown type, or a partial record at the buffer tail
+    }
+    out->type = (laser_command_type_t)src[0];
+    switch (out->type) {
+        case LASER_CMD_GOTO:
+            out->pos.x = get_u16(src + 1);
+            out->pos.y = get_u16(src + 3);
+            break;
+        case LASER_CMD_LASER:
+            out->col.r = get_u16(src + 1);
+            out->col.g = get_u16(src + 3);
+            out->col.b = get_u16(src + 5);
+            break;
+        case LASER_CMD_DWELL:
+            out->dwell.dt = get_u32(src + 1);
+            break;
+        default:
+            return false;   // unreachable
+    }
+    if (consumed) {
+        *consumed = size;
+    }
+    return true;
+}
+
+// The push_* helpers share one serializer (laser_command_encode) so the wire
+// encoding lives in exactly one place; each then does a single atomic enqueue.
 bool laser_command_push_goto(byte_queue_t *q, uint16_t x, uint16_t y) {
-    uint8_t rec[REC_GOTO];
-    rec[0] = LASER_CMD_GOTO;
-    put_u16(rec + 1, x);
-    put_u16(rec + 3, y);
-    return byte_queue_write(q, rec, sizeof rec);
+    laser_command_t c = { .type = LASER_CMD_GOTO, .pos = { .x = x, .y = y } };
+    uint8_t rec[REC_MAX];
+    uint32_t n = laser_command_encode(rec, sizeof rec, &c);
+    return byte_queue_write(q, rec, n);
 }
 
 bool laser_command_push_laser(byte_queue_t *q, uint16_t r, uint16_t g, uint16_t b) {
-    uint8_t rec[REC_LASER];
-    rec[0] = LASER_CMD_LASER;
-    put_u16(rec + 1, r);
-    put_u16(rec + 3, g);
-    put_u16(rec + 5, b);
-    return byte_queue_write(q, rec, sizeof rec);
+    laser_command_t c = { .type = LASER_CMD_LASER, .col = { .r = r, .g = g, .b = b } };
+    uint8_t rec[REC_MAX];
+    uint32_t n = laser_command_encode(rec, sizeof rec, &c);
+    return byte_queue_write(q, rec, n);
 }
 
 bool laser_command_push_dwell(byte_queue_t *q, uint32_t dt) {
-    uint8_t rec[REC_DWELL];
-    rec[0] = LASER_CMD_DWELL;
-    put_u32(rec + 1, dt);
-    return byte_queue_write(q, rec, sizeof rec);
+    laser_command_t c = { .type = LASER_CMD_DWELL, .dwell = { .dt = dt } };
+    uint8_t rec[REC_MAX];
+    uint32_t n = laser_command_encode(rec, sizeof rec, &c);
+    return byte_queue_write(q, rec, n);
 }
 
 bool IRAM_ATTR laser_command_pop(byte_queue_t *q, laser_command_t *out) {

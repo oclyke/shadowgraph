@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "src_udp.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        renderer
+        scene_stream
+        laser_command
+        laser_engine
+        lwip
+        esp_timer
+)

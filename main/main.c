@@ -1,9 +1,7 @@
-// shadowgraph demo: trace a morphing Lissajous "ballywhoop" on the galvos while
-// slowly cycling the laser color through the HSV hue wheel at 25% intensity.
-// Exercises the full laser_engine path end to end: queue, command codec,
-// timer-paced consumer, and galvo + laser DAC writes.
-#include <math.h>
-
+// shadowgraph: bring up the DACs + laser engine, then drive the engine through
+// the renderer mux. One source is active at a time (renderer_select switches
+// them): the idle Lissajous demo, or a scene streamed in over UDP. A SoftAP
+// carries the stream.
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
@@ -14,6 +12,14 @@
 #include "isr_spi.h"
 #include "laser_engine.h"
 #include "wifi_ap.h"
+#include "renderer.h"
+#include "src_idle.h"
+#include "src_udp.h"
+
+// Renderer source ids. id 0 is the safe default/idle source.
+enum { SRC_IDLE = 0, SRC_UDP = 1 };
+
+#define STREAM_UDP_PORT  7777
 
 static const char *TAG = "shadowgraph";
 
@@ -24,6 +30,8 @@ static const char *TAG = "shadowgraph";
 #define GALVO_PIN_MOSI   13
 #define GALVO_PIN_CLK    14
 #define GALVO_CLK_HZ     40000000
+
+#define GALVO_CENTER     0x8000  // mid-scale code for the bipolar galvo drive
 
 // Galvo X  (DAC8871, U$2)
 #define GX_PIN_CS        21
@@ -51,36 +59,6 @@ static const char *TAG = "shadowgraph";
 #define LASER_CH_RED     DACX0004_ADD_A
 #define LASER_CH_GREEN   DACX0004_ADD_B
 #define LASER_CH_BLUE    DACX0004_ADD_C
-
-// ---------------------------------------------------------------------------
-// Demo parameters
-// ---------------------------------------------------------------------------
-#define GALVO_CENTER      0x8000    // mid-scale = zero deflection
-
-// Stay within +/-20% of full-scale travel to keep the galvos in their linear
-// region: 0.20 * 0xFFFF ~= 13107.
-#define GALVO_AMPLITUDE   13107
-
-// "Ballywhoop": a 3:2 Lissajous figure whose y-axis phase precesses slowly, so
-// the figure continuously morphs.
-#define LISSAJOUS_FX      3.0f
-#define LISSAJOUS_FY      2.0f
-#define POINTS_PER_LOOP   256
-#define POINT_DWELL_US    50        // 256 pts * 50 us -> ~78 Hz redraw: well
-                                    // above flicker fusion, looks continuous
-#define POINT_PERIOD_S    (POINT_DWELL_US * 1e-6f)
-
-// Background animation rates in wall-clock units, so morph/color speed stay
-// constant regardless of the point rate.
-#define MORPH_RATE_RAD_S  1.0f      // y-phase precession (~6 s per full morph)
-#define HUE_RATE_DEG_S    50.0f     // color cycling (~7.2 s per full wheel)
-
-#define LASER_INTENSITY   0.25f     // 25% of full scale
-#define COLOR_EVERY       16        // refresh laser color every N points
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 // ---------------------------------------------------------------------------
 // Device handles + interface args
@@ -122,69 +100,6 @@ static dacx0004_idf6_arg_t laser_arg = {
     .clr_pin    = LASER_PIN_CLR,
     .miso_pin   = -1,
 };
-
-// ---------------------------------------------------------------------------
-// HSV -> 16-bit RGB, with saturation and value fixed at full (S = V = 1).
-// h is in degrees [0, 360).
-// ---------------------------------------------------------------------------
-static void hsv_to_rgb16(float h, uint16_t *r, uint16_t *g, uint16_t *b)
-{
-    const float c  = LASER_INTENSITY;   // chroma = V * S  (V = LASER_INTENSITY, S = 1)
-    const float hp = h / 60.0f;
-    const float x  = c * (1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f));
-    float rf = 0.0f, gf = 0.0f, bf = 0.0f;
-
-    if      (hp < 1.0f) { rf = c; gf = x; }
-    else if (hp < 2.0f) { rf = x; gf = c; }
-    else if (hp < 3.0f) { gf = c; bf = x; }
-    else if (hp < 4.0f) { gf = x; bf = c; }
-    else if (hp < 5.0f) { rf = x; bf = c; }
-    else                { rf = c; bf = x; }
-
-    *r = (uint16_t)(rf * 0xFFFF);
-    *g = (uint16_t)(gf * 0xFFFF);
-    *b = (uint16_t)(bf * 0xFFFF);
-}
-
-// ---------------------------------------------------------------------------
-// Renderer: trace a morphing Lissajous ("ballywhoop") while slowly cycling the
-// hue. Each point is goto + color + dwell; producer-side calls retry on a full
-// queue (the consumer drains at the dwell rate).
-// ---------------------------------------------------------------------------
-static void render_task(void *arg)
-{
-    (void)arg;
-
-    const float two_pi = (float)(2.0 * M_PI);
-    const float t_step = two_pi / POINTS_PER_LOOP;
-    float t = 0.0f, phase = 0.0f, hue = 0.0f;
-    int color_div = 0;
-    uint16_t r = 0, g = 0, b = 0;
-
-    for (;;) {
-        int32_t x = GALVO_CENTER + (int32_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FX * t));
-        int32_t y = GALVO_CENTER + (int32_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FY * t + phase));
-
-        while (!laser_engine_goto((uint16_t)x, (uint16_t)y)) { vTaskDelay(1); }
-
-        // Color drifts slowly, so refresh it only every COLOR_EVERY points to
-        // keep per-point SPI traffic low at the high point rate.
-        if (color_div == 0) {
-            hsv_to_rgb16(hue, &r, &g, &b);
-            while (!laser_engine_laser(r, g, b)) { vTaskDelay(1); }
-        }
-        if (++color_div >= COLOR_EVERY) color_div = 0;
-
-        while (!laser_engine_dwell(POINT_DWELL_US)) { vTaskDelay(1); }
-
-        t += t_step;
-        if (t >= two_pi) t -= two_pi;
-        phase += MORPH_RATE_RAD_S * POINT_PERIOD_S;
-        if (phase >= two_pi) phase -= two_pi;
-        hue += HUE_RATE_DEG_S * POINT_PERIOD_S;
-        if (hue >= 360.0f) hue -= 360.0f;
-    }
-}
 
 void app_main(void)
 {
@@ -257,9 +172,32 @@ void app_main(void)
         ESP_LOGE(TAG, "laser_engine_init failed"); return;
     }
     laser_engine_start();
-    ESP_LOGI(TAG, "laser engine started; tracing ballywhoop at 25%% intensity");
+    ESP_LOGI(TAG, "laser engine started");
 
-    // Renderer on core 1; the gptimer consumer ISR runs on core 0 (where it was
-    // installed), so the two don't contend for the same CPU.
-    xTaskCreatePinnedToCore(render_task, "render", 4096, NULL, 5, NULL, 1);
+    // -- Renderer mux on core 1; the gptimer consumer ISR runs on core 0 (where
+    //    it was installed), so the two don't contend for the same CPU. The mux
+    //    is the single producer; sources take turns feeding the engine. --------
+    renderer_cfg_t rcfg = { .task_core = 1, .task_prio = 5 };
+    if (!renderer_init(&rcfg)) {
+        ESP_LOGE(TAG, "renderer_init failed"); return;
+    }
+    renderer_register(SRC_IDLE, src_idle_get());
+
+    const renderer_source_t *udp = src_udp_init(STREAM_UDP_PORT);
+    if (udp) {
+        renderer_register(SRC_UDP, udp);
+    }
+
+    // Default to the UDP stream so a PC can drive the laser out of the box; when
+    // no scene is arriving the engine underruns and safely blanks. Fall back to
+    // the idle demo if the UDP source failed to come up. Switch at runtime with
+    // renderer_select(SRC_IDLE | SRC_UDP) (the hook a future UI / control plane
+    // calls).
+    renderer_select(udp ? SRC_UDP : SRC_IDLE);
+    if (udp) {
+        ESP_LOGI(TAG, "renderer up; streaming source active (udp/%d on 192.168.4.1)",
+                 STREAM_UDP_PORT);
+    } else {
+        ESP_LOGW(TAG, "renderer up; udp source unavailable, running idle demo");
+    }
 }

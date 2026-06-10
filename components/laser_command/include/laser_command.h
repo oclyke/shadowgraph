@@ -29,6 +29,21 @@ typedef struct {
 // Encoded record size including the 1-byte type tag, or 0 for an unknown type.
 uint32_t laser_command_size(laser_command_type_t type);
 
+// Buffer codec (no queue): serialize/deserialize a single command to/from a
+// plain byte buffer, using the exact same on-wire encoding as the queue push/
+// pop paths. Used by the network layer (and a host sender) so the wire format
+// has one source of truth.
+//
+// encode: writes the record for *c into dst. Returns the number of bytes
+// written, or 0 if the type is unknown or cap is too small (dst untouched).
+uint32_t laser_command_encode(uint8_t *dst, uint32_t cap, const laser_command_t *c);
+
+// decode: reads one command from src[0..len) into *out. Returns false if len is
+// shorter than the record implied by the leading type byte, or the type is
+// unknown. On success, *consumed (if non-NULL) is set to the record size.
+bool laser_command_decode(const uint8_t *src, uint32_t len,
+                          laser_command_t *out, uint32_t *consumed);
+
 // Producer side: serialize and atomically enqueue. Returns false if the queue
 // has insufficient room (the queue is left unchanged).
 bool laser_command_push_goto (byte_queue_t *q, uint16_t x, uint16_t y);
