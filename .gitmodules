@@ -7,3 +7,6 @@
 [submodule "third-party/github.com/oclyke/driver-DACx0004"]
 	path = third-party/github.com/oclyke/driver-DACx0004
 	url = https://github.com/oclyke/driver-DACx0004.git
+[submodule "third-party/github.com/google/googletest"]
+	path = third-party/github.com/google/googletest
+	url = https://github.com/google/googletest.git
