@@ -11,6 +11,7 @@
 
 #include "dac8871_idf6.h"
 #include "dacx0004_idf6.h"
+#include "isr_spi.h"
 #include "laser_engine.h"
 #include "wifi_ap.h"
 
@@ -87,6 +88,12 @@ static const char *TAG = "shadowgraph";
 static dac8871_dev_t  galvo_x = {0};
 static dac8871_dev_t  galvo_y = {0};
 static dacx0004_dev_t laser   = {0};
+
+// ISR-safe SPI writers used by the laser engine on the hot path. Initialized
+// after the devices are primed (which routes each CS to its peripheral line).
+static isr_spi_dev_t  isr_gx    = {0};
+static isr_spi_dev_t  isr_gy    = {0};
+static isr_spi_dev_t  isr_laser = {0};
 
 static dac8871_idf6_arg_t galvo_x_arg = {
     .host       = GALVO_SPI_HOST,
@@ -219,18 +226,32 @@ void app_main(void)
         ESP_LOGE(TAG, "laser init failed"); return;
     }
 
-    // -- Laser engine: consumer pinned to core 1; it primes the DACs (forcing
-    //    both galvos onto the shared bus) and blanks the laser at start. ------
+    // -- Prime each device once through the IDF driver. The first transmit adds
+    //    the device to its bus (spi_bus_add_device), which routes the CS pin to
+    //    a peripheral CS line, assigning them in add order: galvo_x -> CS0,
+    //    galvo_y -> CS1 on the galvo bus; laser -> CS0 on its own bus. After
+    //    this the engine drives the buses through isr_spi only. -----------------
+    dac8871_set_code(&galvo_x, GALVO_CENTER);
+    dac8871_set_code(&galvo_y, GALVO_CENTER);
+    dacx0004_write_update_channel(&laser, LASER_CH_RED, 0);
+
+    // -- Build the ISR-safe writers now that CS routing + clock are set up. The
+    //    cs_id / mode / clock here must match the priming config above:
+    //    galvos = mode 0, laser = mode 2 (see the idf6 wrappers). ---------------
+    ESP_ERROR_CHECK(isr_spi_dev_init(&isr_gx,    GALVO_SPI_HOST, 0, 0, GALVO_CLK_HZ));
+    ESP_ERROR_CHECK(isr_spi_dev_init(&isr_gy,    GALVO_SPI_HOST, 1, 0, GALVO_CLK_HZ));
+    ESP_ERROR_CHECK(isr_spi_dev_init(&isr_laser, LASER_SPI_HOST, 0, 2, LASER_CLK_HZ));
+
+    // -- Laser engine: the consumer is the gptimer ISR (no output task). It
+    //    centers the galvo and blanks the laser at start. ----------------------
     laser_engine_cfg_t cfg = {
-        .galvo_x   = &galvo_x,
-        .galvo_y   = &galvo_y,
-        .laser     = &laser,
-        .ch_r      = LASER_CH_RED,
-        .ch_g      = LASER_CH_GREEN,
-        .ch_b      = LASER_CH_BLUE,
-        .retry_us  = 1000,
-        .task_core = 1,
-        .task_prio = configMAX_PRIORITIES - 1,
+        .galvo_x  = &isr_gx,
+        .galvo_y  = &isr_gy,
+        .laser    = &isr_laser,
+        .ch_r     = LASER_CH_RED,
+        .ch_g     = LASER_CH_GREEN,
+        .ch_b     = LASER_CH_BLUE,
+        .retry_us = 1000,
     };
     if (!laser_engine_init(&cfg)) {
         ESP_LOGE(TAG, "laser_engine_init failed"); return;
@@ -238,6 +259,7 @@ void app_main(void)
     laser_engine_start();
     ESP_LOGI(TAG, "laser engine started; tracing ballywhoop at 25%% intensity");
 
-    // Renderer on core 0 (the consumer owns core 1).
-    xTaskCreatePinnedToCore(render_task, "render", 4096, NULL, 5, NULL, 0);
+    // Renderer on core 1; the gptimer consumer ISR runs on core 0 (where it was
+    // installed), so the two don't contend for the same CPU.
+    xTaskCreatePinnedToCore(render_task, "render", 4096, NULL, 5, NULL, 1);
 }
