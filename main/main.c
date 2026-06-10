@@ -64,11 +64,17 @@ static const char *TAG = "shadowgraph";
 #define LISSAJOUS_FX      3.0f
 #define LISSAJOUS_FY      2.0f
 #define POINTS_PER_LOOP   256
-#define POINT_DWELL_US    2000      // 2 ms/point -> ~0.5 s per base loop
-#define PHASE_STEP        0.002f    // y-phase precession per point (radians)
+#define POINT_DWELL_US    50        // 256 pts * 50 us -> ~78 Hz redraw: well
+                                    // above flicker fusion, looks continuous
+#define POINT_PERIOD_S    (POINT_DWELL_US * 1e-6f)
 
-#define HUE_STEP          0.1f      // degrees/point -> ~7.2 s per color cycle
+// Background animation rates in wall-clock units, so morph/color speed stay
+// constant regardless of the point rate.
+#define MORPH_RATE_RAD_S  1.0f      // y-phase precession (~6 s per full morph)
+#define HUE_RATE_DEG_S    50.0f     // color cycling (~7.2 s per full wheel)
+
 #define LASER_INTENSITY   0.25f     // 25% of full scale
+#define COLOR_EVERY       16        // refresh laser color every N points
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -144,23 +150,30 @@ static void render_task(void *arg)
     const float two_pi = (float)(2.0 * M_PI);
     const float t_step = two_pi / POINTS_PER_LOOP;
     float t = 0.0f, phase = 0.0f, hue = 0.0f;
+    int color_div = 0;
+    uint16_t r = 0, g = 0, b = 0;
 
     for (;;) {
         int32_t x = GALVO_CENTER + (int32_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FX * t));
         int32_t y = GALVO_CENTER + (int32_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FY * t + phase));
 
-        uint16_t r, g, b;
-        hsv_to_rgb16(hue, &r, &g, &b);
-
         while (!laser_engine_goto((uint16_t)x, (uint16_t)y)) { vTaskDelay(1); }
-        while (!laser_engine_laser(r, g, b))                 { vTaskDelay(1); }
-        while (!laser_engine_dwell(POINT_DWELL_US))          { vTaskDelay(1); }
+
+        // Color drifts slowly, so refresh it only every COLOR_EVERY points to
+        // keep per-point SPI traffic low at the high point rate.
+        if (color_div == 0) {
+            hsv_to_rgb16(hue, &r, &g, &b);
+            while (!laser_engine_laser(r, g, b)) { vTaskDelay(1); }
+        }
+        if (++color_div >= COLOR_EVERY) color_div = 0;
+
+        while (!laser_engine_dwell(POINT_DWELL_US)) { vTaskDelay(1); }
 
         t += t_step;
         if (t >= two_pi) t -= two_pi;
-        phase += PHASE_STEP;
+        phase += MORPH_RATE_RAD_S * POINT_PERIOD_S;
         if (phase >= two_pi) phase -= two_pi;
-        hue += HUE_STEP;
+        hue += HUE_RATE_DEG_S * POINT_PERIOD_S;
         if (hue >= 360.0f) hue -= 360.0f;
     }
 }
