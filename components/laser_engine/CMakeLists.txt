@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "laser_engine.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        byte_queue
+        laser_command
+        driver_dac8871
+        driver_dacx0004
+        esp_driver_gptimer
+        esp_driver_spi
+)
