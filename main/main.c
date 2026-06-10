@@ -1,4 +1,9 @@
-#include <stdio.h>
+// shadowgraph demo: park the beam at center and cycle its color through the
+// HSV hue wheel. This exercises the full laser_engine path end to end (queue,
+// command codec, timer-paced consumer, galvo + laser DAC writes) with the
+// simplest possible renderer, before moving on to motion patterns.
+#include <math.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
@@ -6,11 +11,12 @@
 
 #include "dac8871_idf6.h"
 #include "dacx0004_idf6.h"
+#include "laser_engine.h"
 
 static const char *TAG = "shadowgraph";
 
 // ---------------------------------------------------------------------------
-// Galvo SPI bus  (SPI2 / HSPI)
+// Galvo SPI bus  (SPI2 / HSPI) — two DAC8871s share the bus
 // ---------------------------------------------------------------------------
 #define GALVO_SPI_HOST   SPI2_HOST
 #define GALVO_PIN_MOSI   13
@@ -28,7 +34,7 @@ static const char *TAG = "shadowgraph";
 #define GY_PIN_RST       17
 
 // ---------------------------------------------------------------------------
-// Laser SPI bus  (SPI3 / VSPI)
+// Laser SPI bus  (SPI3 / VSPI) — one DAC80004
 // ---------------------------------------------------------------------------
 #define LASER_SPI_HOST   SPI3_HOST
 #define LASER_PIN_MOSI   23
@@ -45,7 +51,14 @@ static const char *TAG = "shadowgraph";
 #define LASER_CH_BLUE    DACX0004_ADD_C
 
 // ---------------------------------------------------------------------------
-// Device handles
+// Demo parameters
+// ---------------------------------------------------------------------------
+#define GALVO_CENTER     0x8000     // mid-scale = zero deflection
+#define HUE_STEPS        360        // color samples per full revolution
+#define STEP_DWELL_US    20000      // 20 ms per hue -> ~7.2 s per full cycle
+
+// ---------------------------------------------------------------------------
+// Device handles + interface args
 // ---------------------------------------------------------------------------
 static dac8871_dev_t  galvo_x = {0};
 static dac8871_dev_t  galvo_y = {0};
@@ -79,9 +92,57 @@ static dacx0004_idf6_arg_t laser_arg = {
     .miso_pin   = -1,
 };
 
+// ---------------------------------------------------------------------------
+// HSV -> 16-bit RGB, with saturation and value fixed at full (S = V = 1).
+// h is in degrees [0, 360).
+// ---------------------------------------------------------------------------
+static void hsv_to_rgb16(float h, uint16_t *r, uint16_t *g, uint16_t *b)
+{
+    const float c  = 1.0f;   // chroma = V * S
+    const float hp = h / 60.0f;
+    const float x  = c * (1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f));
+    float rf = 0.0f, gf = 0.0f, bf = 0.0f;
+
+    if      (hp < 1.0f) { rf = c; gf = x; }
+    else if (hp < 2.0f) { rf = x; gf = c; }
+    else if (hp < 3.0f) { gf = c; bf = x; }
+    else if (hp < 4.0f) { gf = x; bf = c; }
+    else if (hp < 5.0f) { rf = x; bf = c; }
+    else                { rf = c; bf = x; }
+
+    *r = (uint16_t)(rf * 0xFFFF);
+    *g = (uint16_t)(gf * 0xFFFF);
+    *b = (uint16_t)(bf * 0xFFFF);
+}
+
+// ---------------------------------------------------------------------------
+// Renderer: park the beam once, then walk the hue wheel forever. Producer-side
+// calls retry on a full queue (the consumer drains at the dwell rate).
+// ---------------------------------------------------------------------------
+static void render_task(void *arg)
+{
+    (void)arg;
+
+    while (!laser_engine_goto(GALVO_CENTER, GALVO_CENTER)) {
+        vTaskDelay(1);
+    }
+
+    float hue = 0.0f;
+    for (;;) {
+        uint16_t r, g, b;
+        hsv_to_rgb16(hue, &r, &g, &b);
+
+        while (!laser_engine_laser(r, g, b))        { vTaskDelay(1); }
+        while (!laser_engine_dwell(STEP_DWELL_US))  { vTaskDelay(1); }
+
+        hue += 360.0f / HUE_STEPS;
+        if (hue >= 360.0f) hue -= 360.0f;
+    }
+}
+
 void app_main(void)
 {
-    // -- Galvo SPI bus (shared by galvo X and Y) ----------------------------
+    // -- SPI buses (one per DAC group) --------------------------------------
     spi_bus_config_t galvo_bus = {
         .mosi_io_num     = GALVO_PIN_MOSI,
         .miso_io_num     = -1,
@@ -92,7 +153,6 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(spi_bus_initialize(GALVO_SPI_HOST, &galvo_bus, SPI_DMA_CH_AUTO));
 
-    // -- Laser SPI bus -------------------------------------------------------
     spi_bus_config_t laser_bus = {
         .mosi_io_num     = LASER_PIN_MOSI,
         .miso_io_num     = -1,
@@ -103,96 +163,36 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LASER_SPI_HOST, &laser_bus, SPI_DMA_CH_AUTO));
 
-    // -- DAC devices ---------------------------------------------------------
-    ESP_ERROR_CHECK(dac8871_init_dev(&galvo_x, &dac8871_if_idf6, &galvo_x_arg) == DAC8871_STAT_OK ? ESP_OK : ESP_FAIL);
-    ESP_ERROR_CHECK(dac8871_init_dev(&galvo_y, &dac8871_if_idf6, &galvo_y_arg) == DAC8871_STAT_OK ? ESP_OK : ESP_FAIL);
-    // Force both devices onto the shared SPI bus before any sweep so neither
-    // CS floats during the other device's first transaction (lazy-init race).
-    dac8871_set_code(&galvo_x, 0x8000);
-    dac8871_set_code(&galvo_y, 0x8000);
-    ESP_ERROR_CHECK(dacx0004_init_dev(&laser, DAC80004, &dacx0004_if_idf6, &laser_arg) == DACX0004_STAT_OK ? ESP_OK : ESP_FAIL);
-
-    ESP_LOGI(TAG, "galvo X, galvo Y, and laser DAC initialised");
-
-    ESP_ERROR_CHECK(dacx0004_write_update_channel(&laser, LASER_CH_RED,   0x0000) == DACX0004_STAT_OK ? ESP_OK : ESP_FAIL);
-    ESP_ERROR_CHECK(dacx0004_write_update_channel(&laser, LASER_CH_GREEN, 0x0000) == DACX0004_STAT_OK ? ESP_OK : ESP_FAIL);
-    ESP_ERROR_CHECK(dacx0004_write_update_channel(&laser, LASER_CH_BLUE,  0x0000) == DACX0004_STAT_OK ? ESP_OK : ESP_FAIL);
-    ESP_LOGI(TAG, "laser red ramping");
-
-    // Ramp red 0 -> 25% -> 0, 50 steps each way at 10 ms/step = 1 second per cycle
-    // 10 ms = 1 tick at CONFIG_FREERTOS_HZ=100; smaller delays truncate to 0
-    #define LASER_MAX  0xFFFF
-    #define RAMP_STEPS 50
-    #define STEP_MS    10
-
-    while (1) {
-
-    
-    #define TEST_RED_RAMP 0
-    #define TEST_GREEN_RAMP 0
-    #define TEST_BLUE_RAMP 0
-    #define TEST_GALVO_SWEEP 1
-
-    #if TEST_RED_RAMP
-        for (int i = 0; i <= RAMP_STEPS; i++) {
-            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
-            dacx0004_write_update_channel(&laser, LASER_CH_BLUE, val);
-            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
-        }
-        for (int i = RAMP_STEPS; i >= 0; i--) {
-            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
-            dacx0004_write_update_channel(&laser, LASER_CH_BLUE, val);
-            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
-        }
-    #endif
-
-    #if TEST_GREEN_RAMP
-        for (int i = 0; i <= RAMP_STEPS; i++) {
-            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
-            dacx0004_write_update_channel(&laser, LASER_CH_GREEN, val);
-            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
-        }
-        for (int i = RAMP_STEPS; i >= 0; i--) {
-            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
-            dacx0004_write_update_channel(&laser, LASER_CH_GREEN, val);
-            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
-        }
-    #endif
-
-    #if TEST_BLUE_RAMP
-        for (int i = 0; i <= RAMP_STEPS; i++) {
-            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
-            dacx0004_write_update_channel(&laser, LASER_CH_BLUE, val);
-            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
-        }
-        for (int i = RAMP_STEPS; i >= 0; i--) {
-            uint16_t val = (uint16_t)((uint32_t)LASER_MAX * i / RAMP_STEPS);
-            dacx0004_write_update_channel(&laser, LASER_CH_BLUE, val);
-            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
-        }
-    #endif
-
-    #if TEST_GALVO_SWEEP
-        for (int i = 0; i <= RAMP_STEPS; i++) {
-            uint16_t val = (uint16_t)((uint32_t)0xFFFF * i / RAMP_STEPS);
-
-            for (int repeat = 0; repeat < 5; repeat++) {
-                dac8871_set_code(&galvo_x, val);
-                dac8871_set_code(&galvo_y, val);
-                dac8871_latch(&galvo_x);
-                dac8871_latch(&galvo_y);
-                vTaskDelay(pdMS_TO_TICKS(STEP_MS));
-            }
-        }
-        for (int i = RAMP_STEPS; i >= 0; i--) {
-            uint16_t val = (uint16_t)((uint32_t)0xFFFF * i / RAMP_STEPS);
-            dac8871_set_code(&galvo_x, val);
-            dac8871_set_code(&galvo_y, val);
-            dac8871_latch(&galvo_x);
-            dac8871_latch(&galvo_y);
-            vTaskDelay(pdMS_TO_TICKS(STEP_MS));
-        }
-    #endif
-
+    // -- DAC devices --------------------------------------------------------
+    if (dac8871_init_dev(&galvo_x, &dac8871_if_idf6, &galvo_x_arg) != DAC8871_STAT_OK) {
+        ESP_LOGE(TAG, "galvo_x init failed"); return;
     }
+    if (dac8871_init_dev(&galvo_y, &dac8871_if_idf6, &galvo_y_arg) != DAC8871_STAT_OK) {
+        ESP_LOGE(TAG, "galvo_y init failed"); return;
+    }
+    if (dacx0004_init_dev(&laser, DAC80004, &dacx0004_if_idf6, &laser_arg) != DACX0004_STAT_OK) {
+        ESP_LOGE(TAG, "laser init failed"); return;
+    }
+
+    // -- Laser engine: consumer pinned to core 1; it primes the DACs (forcing
+    //    both galvos onto the shared bus) and blanks the laser at start. ------
+    laser_engine_cfg_t cfg = {
+        .galvo_x   = &galvo_x,
+        .galvo_y   = &galvo_y,
+        .laser     = &laser,
+        .ch_r      = LASER_CH_RED,
+        .ch_g      = LASER_CH_GREEN,
+        .ch_b      = LASER_CH_BLUE,
+        .retry_us  = 1000,
+        .task_core = 1,
+        .task_prio = configMAX_PRIORITIES - 1,
+    };
+    if (!laser_engine_init(&cfg)) {
+        ESP_LOGE(TAG, "laser_engine_init failed"); return;
+    }
+    laser_engine_start();
+    ESP_LOGI(TAG, "laser engine started; cycling HSV at center");
+
+    // Renderer on core 0 (the consumer owns core 1).
+    xTaskCreatePinnedToCore(render_task, "render", 4096, NULL, 5, NULL, 0);
 }
