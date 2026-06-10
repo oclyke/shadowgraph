@@ -17,7 +17,7 @@ static dac8871_status_e write_16b(uint16_t dat, void *arg)
     if (!a->spi_initialized) {
         spi_device_interface_config_t devcfg = {
             .clock_speed_hz = (int)a->clk_freq,
-            .mode           = 1,
+            .mode           = 0,
             .spics_io_num   = a->cs_pin,
             .queue_size     = (int)a->spi_q_size,
         };
