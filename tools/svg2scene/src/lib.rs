@@ -10,6 +10,7 @@
 //!
 //! [`viz`] can dump any stage to an SVG for inspection.
 
+pub mod analyze;
 pub mod emit;
 pub mod model;
 pub mod optimize;
