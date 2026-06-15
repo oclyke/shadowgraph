@@ -8,6 +8,7 @@ TEST(LaserCommand, Sizes) {
     EXPECT_EQ(laser_command_size(LASER_CMD_GOTO), 5u);
     EXPECT_EQ(laser_command_size(LASER_CMD_LASER), 7u);
     EXPECT_EQ(laser_command_size(LASER_CMD_DWELL), 5u);
+    EXPECT_EQ(laser_command_size(LASER_CMD_CURVE), 21u);
     EXPECT_EQ(laser_command_size(static_cast<laser_command_type_t>(0xFF)), 0u);
 }
 
@@ -36,6 +37,39 @@ TEST(LaserCommand, RoundTrip) {
     EXPECT_EQ(c.dwell.dt, 0xDEADBEEFu);
 
     EXPECT_FALSE(laser_command_pop(&q, &c));   // empty
+}
+
+TEST(LaserCommand, CurveRoundTrip) {
+    byte_queue_t q;
+    uint8_t buf[64];
+    byte_queue_init(&q, buf, 64);
+    EXPECT_TRUE(laser_command_push_curve(&q,
+        0x1111, 0x2222,            // P1
+        0x3333, 0x4444,            // P2
+        0x5555, 0x6666,            // P3
+        0x00ABCDEF, 0x00123456));  // v_in, v_out (counts/s)
+
+    laser_command_t c;
+    ASSERT_TRUE(laser_command_pop(&q, &c));
+    EXPECT_EQ(c.type, LASER_CMD_CURVE);
+    EXPECT_EQ(c.curve.x1, 0x1111);
+    EXPECT_EQ(c.curve.y1, 0x2222);
+    EXPECT_EQ(c.curve.x2, 0x3333);
+    EXPECT_EQ(c.curve.y2, 0x4444);
+    EXPECT_EQ(c.curve.x3, 0x5555);
+    EXPECT_EQ(c.curve.y3, 0x6666);
+    EXPECT_EQ(c.curve.v_in,  0x00ABCDEFu);
+    EXPECT_EQ(c.curve.v_out, 0x00123456u);
+
+    EXPECT_FALSE(laser_command_pop(&q, &c));   // empty
+}
+
+TEST(LaserCommand, CurveQueueFull) {
+    byte_queue_t q;
+    uint8_t buf[32];                           // holds one 21-byte curve, not two
+    byte_queue_init(&q, buf, 32);
+    EXPECT_TRUE (laser_command_push_curve(&q, 1,2,3,4,5,6, 7,8));
+    EXPECT_FALSE(laser_command_push_curve(&q, 1,2,3,4,5,6, 7,8));   // 11 free, needs 21
 }
 
 TEST(LaserCommand, QueueFull) {
