@@ -17,6 +17,8 @@
 
 static const char *TAG = "shadowgraph";
 
+#define ENABLE_WIFI 0
+
 // ---------------------------------------------------------------------------
 // Galvo SPI bus  (SPI2 / HSPI) — two DAC8871s share the bus
 // ---------------------------------------------------------------------------
@@ -188,11 +190,13 @@ static void render_task(void *arg)
 
 void app_main(void)
 {
+    #if ENABLE_WIFI
     // -- Networking: bring up the SoftAP for streaming. Owns NVS / netif /
     //    event loop, so start it first. --------------------------------------
     if (!wifi_ap_start()) {
         ESP_LOGE(TAG, "wifi_ap_start failed");  // non-fatal: keep tracing
     }
+    #endif
 
     // -- SPI buses (one per DAC group) --------------------------------------
     spi_bus_config_t galvo_bus = {
