@@ -217,7 +217,11 @@ Notes:
   arbitrary t. (Forward differencing is only for fixed parameter steps.)
 - 1st-order Taylor causes mild feedrate ripple; a 2nd-order term or a one-step
   Newton on `t(s)` removes it — Phase 2 polish if scope/ripple warrants.
-- A few 32×32→64 mults and ~3 integer sqrts per tick; trivial at 240 MHz / ~10 µs.
+- A few 32×32→64 mults and ~3 integer sqrts + ~6 int64 divides per tick. Measured
+  budget is ~8–12 µs/setpoint (math + 2 galvo SPI writes), so the default tick is
+  **Δτ = 20 µs (50 kHz)** for headroom. The gptimer stays at 1 MHz for DWELL
+  scheduling resolution — independent of Δτ. 1 MHz interpolation is infeasible
+  (ISR can't execute in 1 µs, and the galvo can't track it).
 
 ### 5.3 Sharing & config
 - `curve_interp.c/.h` compiles into firmware (called from the ISR) **and** into
@@ -321,8 +325,16 @@ Stages (each independent + testable, with a debug dump — the prior project val
   - A small **speed floor** (~1 count/tick) guarantees forward progress so every
     segment terminates. Each int64 product is annotated with its worst-case
     magnitude in `curve_interp.c` for overflow auditability.
-- **Phase 1 — Firmware.** Curve-mode state machine in `laser_engine`; on-device
-  demo. *Deliverable: device draws a hand-authored chained-curve scene.*
+- **Phase 1 — Firmware. ✅ CODE DONE (2026-06-15), pending on-device run.**
+  Curve-mode state machine in `laser_engine` (pop CURVE → `curve_interp_begin`,
+  one `curve_interp_step` per timer fire → galvo DACs, paced at Δτ via the
+  anchored deadline; abandons the curve on corruption/underrun).
+  `laser_engine_curve(...)` producer added. Default Δτ = 20 µs (50 kHz).
+  On-device demo in `main/main.c` (`DEMO_FIGURE_EIGHT`): a cubic-native
+  figure-eight (Gerono lemniscate) as a chained Hermite→Bézier spline, one
+  `CURVE` per segment, hue cycling; fed `v_in=v_out=v_max` so the firmware's
+  friction-circle interpolator picks the speed. **Full firmware builds clean.**
+  *Remaining: flash + observe on hardware (scope galvo / watch the beam).*
 - **Phase 2 — Host tool.** Rebuild `tools/svg2scene` stages 1–8; FFI simulation &
   viz; limit tests. *Deliverable: SVG → scene.bin that the device draws.*
 - **Phase 3 — Streaming & polish.** Port the UDP sender; animation (per-frame

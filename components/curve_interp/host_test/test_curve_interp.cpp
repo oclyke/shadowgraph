@@ -118,6 +118,8 @@ TEST(CurveInterp, DecelToStopRespectsAmax) {
 // and the centripetal accel v^2*kappa must stay within a_max.
 TEST(CurveInterp, TightArcLimitsCentripetal) {
     auto lim = default_limits();
+    lim.dt_tick_us = 5;          // dense sampling so curvature reconstruction is
+                                 // robust regardless of the default tick rate
     curve_state_t st;
     // Quarter circle, centre (32768,32768), r=1500, cubic handle k=0.5523*r=828.
     auto s = run(st, lim, 34268, 32768, 34268, 33596, 33596, 34268, 32768, 34268,

@@ -231,8 +231,10 @@ bool IRAM_ATTR curve_interp_step(curve_state_t *st, uint16_t *out_x,
     st->t = t_next;
     int64_t px = eval_pos(st->ax, st->bx, st->cx, st->dx, st->t);
     int64_t py = eval_pos(st->ay, st->by, st->cy, st->dy, st->t);
-    if (px < 0) px = 0; if (px > 65535) px = 65535;
-    if (py < 0) py = 0; if (py > 65535) py = 65535;
+    if (px < 0)     px = 0;
+    if (px > 65535) px = 65535;
+    if (py < 0)     py = 0;
+    if (py > 65535) py = 65535;
     if (out_x) *out_x = (uint16_t)px;
     if (out_y) *out_y = (uint16_t)py;
     if (carry_v_cps) *carry_v_cps = st->v;

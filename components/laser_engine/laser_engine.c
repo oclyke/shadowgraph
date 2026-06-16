@@ -1,6 +1,7 @@
 #include "laser_engine.h"
 #include "byte_queue.h"
 #include "laser_command.h"
+#include "curve_interp.h"
 
 #include "driver/gptimer.h"
 #include "esp_attr.h"
@@ -17,6 +18,19 @@ static laser_engine_cfg_t s_cfg;
 static gptimer_handle_t   s_timer;
 static uint64_t           s_next_deadline;   // intended fire time, in timer ticks
 static volatile uint32_t  s_corrupt_count;   // bumped in ISR; inspect from a task
+
+// Galvo position the engine last wrote. A CURVE's P0 is implicit (this position),
+// so we track it on every GOTO and on each interpolated curve setpoint.
+static uint16_t           s_cur_x = 0x8000;
+static uint16_t           s_cur_y = 0x8000;
+
+// In-flight CURVE state. While s_curve_active, each timer fire emits exactly one
+// interpolated setpoint (paced at s_curve_lim.dt_tick_us) instead of draining
+// instantaneous commands. s_curve_lim is the shared galvo limit contract — the
+// host plans against the same CURVE_DEFAULT_* numbers (see docs/CURVE_MOTION.md).
+static curve_state_t      s_curve;
+static bool               s_curve_active;
+static curve_limits_t     s_curve_lim;
 
 // ---------------------------------------------------------------------------
 // DAC wire encoders (build the exact bytes the drivers would send, inline, so
@@ -58,6 +72,8 @@ static void IRAM_ATTR dispatch(const laser_command_t *c)
             // write; X then Y land within ~a couple of us of each other.
             galvo_write(s_cfg.galvo_x, c->pos.x);
             galvo_write(s_cfg.galvo_y, c->pos.y);
+            s_cur_x = c->pos.x;     // track for the next CURVE's implicit P0
+            s_cur_y = c->pos.y;
             break;
         case LASER_CMD_LASER:
             laser_write_ch(s_cfg.ch_r, c->col.r);
@@ -103,6 +119,34 @@ static void IRAM_ATTR flush_q(void)
 static void IRAM_ATTR drain(void)
 {
     for (;;) {
+        // A CURVE in flight takes priority: emit exactly ONE interpolated setpoint
+        // per timer fire, paced like an implicit DWELL(dt_tick_us). The galvo
+        // continuously chases the curve at the engine's native tick rate, so a
+        // straight or gentle arc draws smoothly without the host pre-expanding it
+        // into hundreds of GOTOs. See docs/CURVE_MOTION.md.
+        if (s_curve_active) {
+            uint16_t x, y;
+            int64_t  carry;
+            bool going = curve_interp_step(&s_curve, &x, &y, &carry);
+            galvo_write(s_cfg.galvo_x, x);
+            galvo_write(s_cfg.galvo_y, y);
+            s_cur_x = x;
+            s_cur_y = y;
+            if (!going) {
+                s_curve_active = false;   // P3 emitted; resume draining next fire
+            }
+            s_next_deadline += (uint32_t)s_curve_lim.dt_tick_us;
+            uint64_t now = now_ticks();
+            if (s_next_deadline > now + MIN_LEAD_TICKS) {
+                arm_at(s_next_deadline);
+                if (now_ticks() < s_next_deadline) {
+                    return;               // safely armed for the next setpoint
+                }
+                // The count passed us during arming: fall through and keep going.
+            }
+            continue;   // overrun: emit the next setpoint immediately to catch up
+        }
+
         uint8_t type;
         if (byte_queue_peek(&s_q, &type, 1) < 1) {
             // Underrun: keep the beam safe, hold galvo, retry shortly. Reset
@@ -130,6 +174,22 @@ static void IRAM_ATTR drain(void)
             continue;   // overrun or sub-floor dwell: catch up immediately
         }
 
+        if ((laser_command_type_t)type == LASER_CMD_CURVE) {
+            laser_command_t c;
+            if (!laser_command_pop(&s_q, &c)) { goto corrupt; }
+            // P0 is implicit: the current galvo position. Prime the interpolator
+            // and switch to curve mode; the next loop iteration emits the first
+            // setpoint (and arms the timer for one tick).
+            curve_interp_begin(&s_curve, &s_curve_lim,
+                               (int32_t)s_cur_x,    (int32_t)s_cur_y,
+                               (int32_t)c.curve.x1, (int32_t)c.curve.y1,
+                               (int32_t)c.curve.x2, (int32_t)c.curve.y2,
+                               (int32_t)c.curve.x3, (int32_t)c.curve.y3,
+                               (int64_t)c.curve.v_in, (int64_t)c.curve.v_out);
+            s_curve_active = true;
+            continue;
+        }
+
         laser_command_t c;
         if (!laser_command_pop(&s_q, &c)) { goto corrupt; }
         dispatch(&c);
@@ -142,6 +202,7 @@ corrupt:
     s_corrupt_count++;
     flush_q();
     blank_laser();
+    s_curve_active = false;     // abandon any in-flight curve on corruption
     s_next_deadline = now_ticks() + s_cfg.retry_us;
     arm_at(s_next_deadline);
 }
@@ -167,6 +228,13 @@ bool laser_engine_init(const laser_engine_cfg_t *cfg)
     s_cfg = *cfg;
     if (s_cfg.retry_us == 0) s_cfg.retry_us = 1000;
 
+    // Galvo motion limits the CURVE interpolator plans against. These are the
+    // shared contract: the host plans against the same CURVE_DEFAULT_* numbers.
+    s_curve_lim.v_max_cps  = CURVE_DEFAULT_V_MAX_CPS;
+    s_curve_lim.a_max_cps2 = CURVE_DEFAULT_A_MAX_CPS2;
+    s_curve_lim.dt_tick_us = CURVE_DEFAULT_DT_TICK_US;
+    s_curve_active = false;
+
     if (!byte_queue_init(&s_q, s_qbuf, LASER_Q_CAP)) {
         return false;
     }
@@ -191,6 +259,9 @@ void laser_engine_start(void)
     // too, so this one-time bring-up is fine here.
     galvo_write(s_cfg.galvo_x, 0x8000);   // mid-scale = zero deflection
     galvo_write(s_cfg.galvo_y, 0x8000);
+    s_cur_x = 0x8000;                     // track the known start position
+    s_cur_y = 0x8000;
+    s_curve_active = false;
     blank_laser();
 
     gptimer_start(s_timer);
@@ -209,4 +280,10 @@ bool laser_engine_laser(uint16_t r, uint16_t g, uint16_t b) {
 }
 bool laser_engine_dwell(uint32_t dt_us) {
     return laser_command_push_dwell(&s_q, dt_us);
+}
+bool laser_engine_curve(uint16_t x1, uint16_t y1,
+                        uint16_t x2, uint16_t y2,
+                        uint16_t x3, uint16_t y3,
+                        uint32_t v_in, uint32_t v_out) {
+    return laser_command_push_curve(&s_q, x1, y1, x2, y2, x3, y3, v_in, v_out);
 }

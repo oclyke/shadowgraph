@@ -13,6 +13,7 @@
 #include "dacx0004_idf6.h"
 #include "isr_spi.h"
 #include "laser_engine.h"
+#include "curve_interp.h"   // CURVE_DEFAULT_V_MAX_CPS (shared limit contract)
 #include "wifi_ap.h"
 
 static const char *TAG = "shadowgraph";
@@ -83,6 +84,17 @@ static const char *TAG = "shadowgraph";
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// Demo selector: 0 = legacy point-stream Lissajous; 1 = cubic-native figure-eight
+// drawn with LASER_CMD_CURVE (the curve engine). See docs/CURVE_MOTION.md.
+#define DEMO_FIGURE_EIGHT 1
+
+// Figure-eight as a Gerono lemniscate: x = W*sin t, y = (H/2)*sin 2t, t in [0,2pi).
+// Drawn as a chained cubic spline (one CURVE per segment), so the whole figure
+// is ~EIGHT_SEGMENTS*21 bytes on the wire instead of hundreds of GOTOs.
+#define EIGHT_SEGMENTS    16
+#define EIGHT_W           12000.0f   // half-width  (x swing, ~18% of full field)
+#define EIGHT_H           16000.0f   // height param (y swing = H/2)
 
 // ---------------------------------------------------------------------------
 // Device handles + interface args
@@ -188,6 +200,71 @@ static void render_task(void *arg)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Figure-eight position and analytic derivative (Gerono lemniscate).
+// ---------------------------------------------------------------------------
+static void eight_point(float t, float *x, float *y)
+{
+    *x = GALVO_CENTER + EIGHT_W * sinf(t);
+    *y = GALVO_CENTER + 0.5f * EIGHT_H * sinf(2.0f * t);
+}
+static void eight_deriv(float t, float *dx, float *dy)
+{
+    *dx = EIGHT_W * cosf(t);
+    *dy = EIGHT_H * cosf(2.0f * t);   // d/dt[(H/2) sin 2t] = H cos 2t
+}
+
+// ---------------------------------------------------------------------------
+// Renderer: trace a cubic-native figure-eight via LASER_CMD_CURVE, cycling hue.
+// Each segment is a Hermite->Bezier cubic built from the lemniscate's analytic
+// tangents (control point = anchor +/- tangent*dt/3). We hand the firmware
+// v_in=v_out=v_max and let its friction-circle interpolator pick the actual
+// speed (it slows wherever a lobe is tight). A host-side planner (Phase 2) will
+// compute true junction velocities; here the firmware does all the physics.
+// ---------------------------------------------------------------------------
+static void render_eight_task(void *arg)
+{
+    (void)arg;
+    const float two_pi = (float)(2.0 * M_PI);
+    const float dt_par = two_pi / EIGHT_SEGMENTS;     // parameter step per segment
+    const uint32_t V   = (uint32_t)CURVE_DEFAULT_V_MAX_CPS;
+    float hue = 0.0f;
+    uint16_t r = 0, g = 0, b = 0;
+
+    // Jump (blanked) to the start of the figure, then enable the beam. P0 of the
+    // first CURVE is implicit: this position.
+    float sx, sy;
+    eight_point(0.0f, &sx, &sy);
+    while (!laser_engine_laser(0, 0, 0))                          { vTaskDelay(1); }
+    while (!laser_engine_goto((uint16_t)sx, (uint16_t)sy))        { vTaskDelay(1); }
+
+    for (;;) {
+        hsv_to_rgb16(hue, &r, &g, &b);
+        while (!laser_engine_laser(r, g, b))                     { vTaskDelay(1); }
+
+        for (int i = 0; i < EIGHT_SEGMENTS; i++) {
+            float t0 = i * dt_par, t1 = (i + 1) * dt_par;
+            float p0x, p0y, p3x, p3y, d0x, d0y, d1x, d1y;
+            eight_point(t0, &p0x, &p0y);
+            eight_point(t1, &p3x, &p3y);
+            eight_deriv(t0, &d0x, &d0y);
+            eight_deriv(t1, &d1x, &d1y);
+            // Hermite -> Bezier: tangents scaled by dt_par, control arm = T/3.
+            uint16_t c1x = (uint16_t)(p0x + d0x * dt_par / 3.0f);
+            uint16_t c1y = (uint16_t)(p0y + d0y * dt_par / 3.0f);
+            uint16_t c2x = (uint16_t)(p3x - d1x * dt_par / 3.0f);
+            uint16_t c2y = (uint16_t)(p3y - d1y * dt_par / 3.0f);
+            while (!laser_engine_curve(c1x, c1y, c2x, c2y,
+                                       (uint16_t)p3x, (uint16_t)p3y, V, V)) {
+                vTaskDelay(1);
+            }
+        }
+
+        hue += 2.0f;
+        if (hue >= 360.0f) hue -= 360.0f;
+    }
+}
+
 void app_main(void)
 {
     #if ENABLE_WIFI
@@ -261,9 +338,17 @@ void app_main(void)
         ESP_LOGE(TAG, "laser_engine_init failed"); return;
     }
     laser_engine_start();
+#if DEMO_FIGURE_EIGHT
+    ESP_LOGI(TAG, "laser engine started; tracing cubic figure-eight (CURVE)");
+#else
     ESP_LOGI(TAG, "laser engine started; tracing ballywhoop at 25%% intensity");
+#endif
 
     // Renderer on core 1; the gptimer consumer ISR runs on core 0 (where it was
     // installed), so the two don't contend for the same CPU.
+#if DEMO_FIGURE_EIGHT
+    xTaskCreatePinnedToCore(render_eight_task, "render", 4096, NULL, 5, NULL, 1);
+#else
     xTaskCreatePinnedToCore(render_task, "render", 4096, NULL, 5, NULL, 1);
+#endif
 }
