@@ -15,11 +15,14 @@ namespace {
 
 struct Sample { double x, y; int64_t v; };
 
-curve_limits_t default_limits() {
+// Fixed limits for the tests — deliberately NOT the CURVE_DEFAULT_* macros, so
+// retuning the galvo in curve_interp.h never breaks the suite. The geometry and
+// tolerances below are tuned to these numbers.
+curve_limits_t test_limits() {
     curve_limits_t lim;
-    lim.v_max_cps  = CURVE_DEFAULT_V_MAX_CPS;
-    lim.a_max_cps2 = CURVE_DEFAULT_A_MAX_CPS2;
-    lim.dt_tick_us = CURVE_DEFAULT_DT_TICK_US;
+    lim.v_max_cps  = 11468800;
+    lim.a_max_cps2 = 57344000000;
+    lim.dt_tick_us = 20;
     return lim;
 }
 
@@ -56,13 +59,13 @@ double menger(const Sample &a, const Sample &b, const Sample &c) {
     return 2.0 * area2 / (ab * bc * ca);
 }
 
-const double DT_S = CURVE_DEFAULT_DT_TICK_US * 1e-6;
+const double DT_S = 20 * 1e-6; // matches test_limits().dt_tick_us, not the macro
 
 }  // namespace
 
 // A straight at v_max should hold v_max the whole way and land exactly on P3.
 TEST(CurveInterp, StraightAtVmaxIsConstant) {
-    auto lim = default_limits();
+    auto lim = test_limits();
     curve_state_t st;
     // Control points evenly spaced along the line => constant |B'|.
     auto s = run(st, lim, 2768, 32768, 22768, 32768, 42768, 32768, 62768, 32768,
@@ -84,7 +87,7 @@ TEST(CurveInterp, StraightAtVmaxIsConstant) {
 // Accelerating from rest on a straight: tangential accel must stay <= a_max and
 // the speed must climb to v_max.
 TEST(CurveInterp, AccelFromRestRespectsAmax) {
-    auto lim = default_limits();
+    auto lim = test_limits();
     curve_state_t st;
     auto s = run(st, lim, 2768, 32768, 22768, 32768, 42768, 32768, 62768, 32768,
                  0, lim.v_max_cps);
@@ -101,7 +104,7 @@ TEST(CurveInterp, AccelFromRestRespectsAmax) {
 
 // Decelerating to a stop on a straight: |decel| <= a_max and the exit is slow.
 TEST(CurveInterp, DecelToStopRespectsAmax) {
-    auto lim = default_limits();
+    auto lim = test_limits();
     curve_state_t st;
     auto s = run(st, lim, 2768, 32768, 22768, 32768, 42768, 32768, 62768, 32768,
                  lim.v_max_cps, 0);
@@ -117,7 +120,7 @@ TEST(CurveInterp, DecelToStopRespectsAmax) {
 // A tight arc (radius ~1500 counts < v_max^2/a_max ~2300) must force a slowdown,
 // and the centripetal accel v^2*kappa must stay within a_max.
 TEST(CurveInterp, TightArcLimitsCentripetal) {
-    auto lim = default_limits();
+    auto lim = test_limits();
     lim.dt_tick_us = 5;          // dense sampling so curvature reconstruction is
                                  // robust regardless of the default tick rate
     curve_state_t st;
@@ -147,7 +150,7 @@ TEST(CurveInterp, TightArcLimitsCentripetal) {
 
 // Arc-length estimate should match a fine double-precision reference.
 TEST(CurveInterp, ArcLengthAccurate) {
-    auto lim = default_limits();
+    auto lim = test_limits();
     curve_state_t st;
     const double P0x = 10000, P0y = 10000, P1x = 20000, P1y = 50000,
                  P2x = 50000, P2y = 50000, P3x = 60000, P3y = 10000;
@@ -168,7 +171,7 @@ TEST(CurveInterp, ArcLengthAccurate) {
 
 // Calling step() past completion is safe and keeps reporting P3.
 TEST(CurveInterp, StableAfterDone) {
-    auto lim = default_limits();
+    auto lim = test_limits();
     curve_state_t st;
     auto s = run(st, lim, 1000, 1000, 2000, 1000, 3000, 1000, 4000, 1000,
                  lim.v_max_cps, lim.v_max_cps);

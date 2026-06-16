@@ -99,6 +99,15 @@ mod tests {
     use crate::model::Move;
     use kurbo::{CubicBez, Point};
 
+    /// Fixed limits for tests — independent of the firmware's CURVE_DEFAULT_*.
+    fn tlim() -> CurveLimits {
+        CurveLimits {
+            v_max_cps: 11_468_800,
+            a_max_cps2: 57_344_000_000,
+            dt_tick_us: 20,
+        }
+    }
+
     fn line(ax: f64, ay: f64, bx: f64, by: f64) -> Move {
         let a = Point::new(ax, ay);
         let b = Point::new(bx, by);
@@ -113,7 +122,7 @@ mod tests {
 
     #[test]
     fn straight_junction_runs_fast() {
-        let lim = CurveLimits::default();
+        let lim = tlim();
         let m = [line(0.0, 0.0, 10000.0, 0.0), line(10000.0, 0.0, 20000.0, 0.0)];
         let vj = junction_speeds(&m, &lim, 200.0);
         assert!(vj[1] > lim.v_max_cps as f64 * 0.99, "straight should hit v_max");
@@ -121,7 +130,7 @@ mod tests {
 
     #[test]
     fn sharp_corner_slows_a_lot() {
-        let lim = CurveLimits::default();
+        let lim = tlim();
         // 90° corner.
         let m = [
             line(0.0, 0.0, 10000.0, 0.0),

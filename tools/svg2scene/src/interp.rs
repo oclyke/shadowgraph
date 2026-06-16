@@ -127,11 +127,21 @@ pub fn run_curve(
 mod tests {
     use super::*;
 
+    /// Fixed limits for tests — deliberately NOT the firmware defaults, so editing
+    /// curve_interp.h to retune a real galvo never breaks the test suite.
+    fn tlim() -> CurveLimits {
+        CurveLimits {
+            v_max_cps: 11_468_800,
+            a_max_cps2: 57_344_000_000,
+            dt_tick_us: 20,
+        }
+    }
+
     // The keystone: the C library links and runs, a straight curve at v_max holds
     // v_max and lands exactly on P3. (Mirrors the C gtest, proving the FFI path.)
     #[test]
     fn ffi_straight_reaches_endpoint() {
-        let lim = CurveLimits::default();
+        let lim = tlim();
         let mut carry = 0;
         let pts = run_curve(
             &lim,

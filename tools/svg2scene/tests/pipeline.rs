@@ -22,7 +22,13 @@ fn end_to_end_respects_limits() {
     let mut moves = order::build_moves(&segmented);
     assert!(moves.len() > 4);
 
-    let lim = CurveLimits::default();
+    // Fixed limits — independent of the firmware's CURVE_DEFAULT_* so retuning the
+    // galvo in curve_interp.h never breaks this test.
+    let lim = CurveLimits {
+        v_max_cps: 11_468_800,
+        a_max_cps2: 57_344_000_000,
+        dt_tick_us: 20,
+    };
     plan::plan(&mut moves, &lim, 200.0);
 
     // Junction velocities must be feasible: each v_out reachable from v_in.
