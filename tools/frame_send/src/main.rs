@@ -10,6 +10,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
+use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
@@ -53,6 +54,11 @@ struct Args {
     /// frame. Use this to step through frames already buffered on the device.
     #[arg(long)]
     advance: bool,
+
+    /// Push a scene file (raw .scene wire bytes from `svg2scene --output`) as the
+    /// frame instead of a built-in shape. --shape/--size/--intensity are ignored.
+    #[arg(long, value_name = "FILE")]
+    scene: Option<PathBuf>,
 
     /// Shape to draw
     #[arg(long, value_enum, default_value_t = Shape::Square)]
@@ -143,6 +149,19 @@ fn build_frame(args: &Args) -> Vec<u8> {
     f
 }
 
+/// Wrap raw scene bytes (from `svg2scene --output`) into a loopable frame. The
+/// scene's first CURVE has an implicit P0 = the field centre, so we prepend a
+/// blanked GOTO to centre: this defines that P0 on every loop (not just the first)
+/// and blanks the seam between repeats. A trailing blank kills the beam at the end.
+fn wrap_scene(scene: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(scene.len() + 16);
+    laser(&mut f, 0, 0, 0); // blank the seam
+    goto(&mut f, CENTER, CENTER); // define the scene's implicit P0
+    f.extend_from_slice(scene);
+    laser(&mut f, 0, 0, 0); // beam off at the end
+    f
+}
+
 fn build_tcp_packet(payload: &[u8]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(12 + payload.len());
     pkt.extend_from_slice(&FRAME_MAGIC.to_le_bytes());
@@ -179,7 +198,20 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    let payload = build_frame(&args);
+    // Frame payload: a scene file (svg2scene output) or a built-in shape.
+    let (payload, what) = match &args.scene {
+        Some(path) => {
+            let scene = std::fs::read(path)?;
+            if scene.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("scene file {} is empty", path.display()),
+                ));
+            }
+            (wrap_scene(&scene), format!("scene {}", path.display()))
+        }
+        None => (build_frame(&args), format!("shape={:?}", args.shape)),
+    };
     let tcp_pkt = build_tcp_packet(&payload);
 
     // 1. Push the frame over TCP and WAIT for the device's commit ack. The ack
@@ -199,8 +231,8 @@ fn main() -> std::io::Result<()> {
     }
     drop(stream);
     println!(
-        "sent frame shape={:?} ({} cmd bytes), committed by {}:{}",
-        args.shape,
+        "sent frame ({}, {} cmd bytes), committed by {}:{}",
+        what,
         payload.len(),
         args.host,
         args.tcp_port

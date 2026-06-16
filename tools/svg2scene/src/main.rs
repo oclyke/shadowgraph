@@ -200,7 +200,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let scene_out = args.output.clone().or_else(|| bundle("7-scene.bin"));
+    let scene_out = args.output.clone().or_else(|| bundle("scene.bin"));
     if let Some(p) = &scene_out {
         std::fs::write(p, &bytes)?;
         eprintln!("wrote scene -> {}", p.display());

@@ -34,6 +34,24 @@ frame_send --host 172.20.10.2 --shape triangle    # push + advance to it
 frame_send --host 172.20.10.2 --advance           # just advance (past the end → blank)
 ```
 
+## Pushing an svg2scene scene
+
+`svg2scene` emits the same `laser_command` wire bytes this tool sends, so its
+output is a frame payload directly. Render an SVG, then push it:
+
+```sh
+# 1. render the SVG to raw scene bytes
+cargo run --manifest-path tools/svg2scene/Cargo.toml -- drawing.svg -o drawing.scene
+# 2. push it as a frame
+frame_send --host 172.20.10.2 --scene drawing.scene
+```
+
+`--scene` reads the file and wraps it so it loops cleanly: a blanked `GOTO` to the
+field centre is prepended (svg2scene's first curve has an implicit P0 = centre, so
+this defines it on every loop and blanks the seam) and a trailing blank kills the
+beam at the end. `--shape`/`--size`/`--intensity` are ignored (intensity is baked
+into the scene by svg2scene).
+
 The device must be reachable on the network it joined (see the `got ip:` line in
 its serial log) and `ENABLE_FRAME_STREAM` must be on in the firmware (it is by
 default).
@@ -46,7 +64,8 @@ default).
 | `--tcp-port` | `7777` | TCP port for the frame data plane |
 | `--udp-port` | `7778` | UDP port for the playout clock |
 | `--advance` | off | Just advance: send one `NEXT` tick and exit, **without** pushing a frame. Steps through frames already buffered on the device. |
-| `--shape` | `square` | `square` \| `triangle` \| `diamond` |
+| `--scene` | — | Push a scene file (`svg2scene --output` bytes) as the frame instead of a built-in shape. |
+| `--shape` | `square` | `square` \| `triangle` \| `diamond` (ignored with `--scene`) |
 | `--size` | `18000` | Half-extent of the figure in DAC counts (keep well within `0..32767`) |
 | `--intensity` | `0x4000` | Per-channel laser intensity, `0..65535` |
 

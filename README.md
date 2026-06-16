@@ -1,5 +1,10 @@
 # shadowgraph
 
+```
+cargo run --manifest-path tools/svg2scene/Cargo.toml tools/svg2scene/examples/bicycle.svg --debug-output-dir && \
+cargo run --manifest-path tools/frame_send/Cargo.toml -- --host 172.20.10.2  --scene output/scene.bin`
+```
+
 Firmware for a laser projector built on the [LaserScanner](https://github.com/oclyke/LaserScanner)
 hardware: an ESP32 drives two galvanometer axes and an RGB laser from a
 time-ordered command stream. Renderers push `goto` / `laser` / `dwell` commands
@@ -196,8 +201,17 @@ address frames.
 
 ```sh
 cargo run --manifest-path tools/frame_send/Cargo.toml -- --host 172.20.10.2
-# options: --shape square|triangle|diamond  --id N  --size COUNTS  --intensity 0..65535
+# options: --shape square|triangle|diamond  --size COUNTS  --intensity 0..65535
 cargo run --manifest-path tools/frame_send/Cargo.toml -- --host 172.20.10.2 --shape triangle
+```
+
+To render real artwork, `svg2scene` emits the same `laser_command` wire bytes, so
+its output pushes straight through as a frame:
+
+```sh
+cargo run --manifest-path tools/svg2scene/Cargo.toml -- drawing.svg -o drawing.scene
+cargo run --manifest-path tools/frame_send/Cargo.toml -- --host 172.20.10.2 --scene drawing.scene
+```
 
 The device log shows the frame committed and played:
 
