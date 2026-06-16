@@ -187,3 +187,22 @@ TEST(CurveInterp, StableAfterDone) {
         EXPECT_EQ(y, 1000);
     }
 }
+
+// Extreme limits + large dt must NOT overflow begin()'s int64 products. The naive
+// v_max_cps*dt / a_max_cps2*dt^2 would wrap to garbage and make the beam crawl (or
+// hang). With the saturating conversion the interpolator should run at full tilt:
+// a long straight finishes in very few setpoints and reports a positive speed.
+TEST(CurveInterp, ExtremeLimitsNoOverflow) {
+    curve_limits_t lim;
+    lim.v_max_cps  = 114000000000068800LL;  // ~1e17: far past the tick format
+    lim.a_max_cps2 = 573440000000000000LL;  // ~5.7e17
+    lim.dt_tick_us = 105;                    // large enough that v_max_cps*dt overflows
+    curve_state_t st;
+    auto s = run(st, lim, 2768, 32768, 22768, 32768, 42768, 32768, 62768, 32768,
+                 lim.v_max_cps, lim.v_max_cps);
+    ASSERT_FALSE(s.empty());
+    EXPECT_LT(s.size(), 50u);                 // saturated v_max -> traverses fast
+    EXPECT_GT(s.back().v, 0);                  // speed sane, not a crawl/garbage
+    EXPECT_EQ(s.back().x, 62768.0);            // still lands exactly on P3
+    EXPECT_EQ(s.back().y, 32768.0);
+}

@@ -85,16 +85,25 @@ static const char *TAG = "shadowgraph";
 #define M_PI 3.14159265358979323846
 #endif
 
-// Demo selector: 0 = legacy point-stream Lissajous; 1 = cubic-native figure-eight
-// drawn with LASER_CMD_CURVE (the curve engine). See docs/CURVE_MOTION.md.
-#define DEMO_FIGURE_EIGHT 1
+// Demo selector. The CURVE demos exercise the curve engine; see docs/CURVE_MOTION.md.
+#define DEMO_LISSAJOUS     0    // legacy point-stream Lissajous (GOTO + DWELL)
+#define DEMO_FIGURE_EIGHT  1    // cubic-native figure-eight (CURVE)
+#define DEMO_SQUARE        2    // large square, ~90% of full range (CURVE)
+#define DEMO_MODE          DEMO_SQUARE
 
 // Figure-eight as a Gerono lemniscate: x = W*sin t, y = (H/2)*sin 2t, t in [0,2pi).
 // Drawn as a chained cubic spline (one CURVE per segment), so the whole figure
 // is ~EIGHT_SEGMENTS*21 bytes on the wire instead of hundreds of GOTOs.
-#define EIGHT_SEGMENTS    16
+#define EIGHT_SEGMENTS    64
 #define EIGHT_W           12000.0f   // half-width  (x swing, ~18% of full field)
 #define EIGHT_H           16000.0f   // height param (y swing = H/2)
+
+// Large square (DEMO_SQUARE). Each side spans ~90% of the full DAC range
+// (0..0xFFFF): half-side = 0.45 * 0xFFFF, so corners sit at center +/- this and the
+// figure runs 3278..62258. This deliberately drives the galvos well past the
+// conservative +/-20% linear region the Lissajous demo uses — it is a full-range
+// exercise of the engine and the corner accel/decel limiting.
+#define SQUARE_HALF       29490
 
 // ---------------------------------------------------------------------------
 // Device handles + interface args
@@ -160,12 +169,13 @@ static void hsv_to_rgb16(float h, uint16_t *r, uint16_t *g, uint16_t *b)
     *b = (uint16_t)(bf * 0xFFFF);
 }
 
+#if DEMO_MODE == DEMO_LISSAJOUS
 // ---------------------------------------------------------------------------
 // Renderer: trace a morphing Lissajous ("ballywhoop") while slowly cycling the
 // hue. Each point is goto + color + dwell; producer-side calls retry on a full
 // queue (the consumer drains at the dwell rate).
 // ---------------------------------------------------------------------------
-static void render_task(void *arg)
+static void render_lissajous_task(void *arg)
 {
     (void)arg;
 
@@ -199,7 +209,9 @@ static void render_task(void *arg)
         if (hue >= 360.0f) hue -= 360.0f;
     }
 }
+#endif // DEMO_MODE == DEMO_LISSAJOUS
 
+#if DEMO_MODE == DEMO_FIGURE_EIGHT
 // ---------------------------------------------------------------------------
 // Figure-eight position and analytic derivative (Gerono lemniscate).
 // ---------------------------------------------------------------------------
@@ -266,6 +278,56 @@ static void render_eight_task(void *arg)
         if (hue >= 360.0f) hue -= 360.0f;
     }
 }
+#endif // DEMO_MODE == DEMO_FIGURE_EIGHT
+
+#if DEMO_MODE == DEMO_SQUARE
+// ---------------------------------------------------------------------------
+// Renderer: trace a large axis-aligned square via LASER_CMD_CURVE, cycling hue.
+// Each side is a straight (degenerate cubic) CURVE with v_in = v_out = 0, so the
+// interpolator accelerates off each corner and brakes back to rest into the next
+// one — the physically correct way to take a galvo around a 90 deg corner (the
+// direction reverses, so the corner must be a near-stop). Spans ~90% of full scale.
+// ---------------------------------------------------------------------------
+static void render_square_task(void *arg)
+{
+    (void)arg;
+    const int C = GALVO_CENTER, h = SQUARE_HALF;
+    const int corner[4][2] = {
+        { C - h, C - h }, { C + h, C - h }, { C + h, C + h }, { C - h, C + h },
+    };
+    float hue = 0.0f;
+    uint16_t r = 0, g = 0, b = 0;
+
+    // Jump (blanked) to the first corner; P0 of the first CURVE is implicit.
+    while (!laser_engine_laser(0, 0, 0)) { vTaskDelay(1); }
+    while (!laser_engine_goto((uint16_t)corner[0][0], (uint16_t)corner[0][1])) {
+        vTaskDelay(1);
+    }
+
+    for (;;) {
+        hsv_to_rgb16(hue, &r, &g, &b);
+        while (!laser_engine_laser(r, g, b)) { vTaskDelay(1); }
+
+        for (int i = 0; i < 4; i++) {
+            int x0 = corner[i][0],           y0 = corner[i][1];
+            int x3 = corner[(i + 1) % 4][0], y3 = corner[(i + 1) % 4][1];
+            // Straight edge as a cubic with evenly-spaced control points (constant
+            // |B'|). v_in = v_out = 0 -> a clean accel/cruise/decel down each side.
+            uint16_t c1x = (uint16_t)(x0 + (x3 - x0) / 3);
+            uint16_t c1y = (uint16_t)(y0 + (y3 - y0) / 3);
+            uint16_t c2x = (uint16_t)(x0 + 2 * (x3 - x0) / 3);
+            uint16_t c2y = (uint16_t)(y0 + 2 * (y3 - y0) / 3);
+            while (!laser_engine_curve(c1x, c1y, c2x, c2y,
+                                       (uint16_t)x3, (uint16_t)y3, 0, 0)) {
+                vTaskDelay(1);
+            }
+        }
+
+        // hue += 2.0f;
+        // if (hue >= 360.0f) hue -= 360.0f;
+    }
+}
+#endif // DEMO_MODE == DEMO_SQUARE
 
 void app_main(void)
 {
@@ -340,17 +402,17 @@ void app_main(void)
         ESP_LOGE(TAG, "laser_engine_init failed"); return;
     }
     laser_engine_start();
-#if DEMO_FIGURE_EIGHT
-    ESP_LOGI(TAG, "laser engine started; tracing cubic figure-eight (CURVE)");
-#else
-    ESP_LOGI(TAG, "laser engine started; tracing ballywhoop at 25%% intensity");
-#endif
 
     // Renderer on core 1; the gptimer consumer ISR runs on core 0 (where it was
     // installed), so the two don't contend for the same CPU.
-#if DEMO_FIGURE_EIGHT
+#if   DEMO_MODE == DEMO_FIGURE_EIGHT
+    ESP_LOGI(TAG, "laser engine started; tracing cubic figure-eight (CURVE)");
     xTaskCreatePinnedToCore(render_eight_task, "render", 4096, NULL, 5, NULL, 1);
+#elif DEMO_MODE == DEMO_SQUARE
+    ESP_LOGI(TAG, "laser engine started; tracing large square (CURVE)");
+    xTaskCreatePinnedToCore(render_square_task, "render", 4096, NULL, 5, NULL, 1);
 #else
-    xTaskCreatePinnedToCore(render_task, "render", 4096, NULL, 5, NULL, 1);
+    ESP_LOGI(TAG, "laser engine started; tracing Lissajous figure at 25%% intensity");
+    xTaskCreatePinnedToCore(render_lissajous_task, "render", 4096, NULL, 5, NULL, 1);
 #endif
 }

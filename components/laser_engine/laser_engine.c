@@ -9,6 +9,12 @@
 #define LASER_Q_CAP    4096u       // power of two
 #define TIMER_HZ       1000000u    // 1 tick = 1 us
 #define MIN_LEAD_TICKS 4u          // don't arm an alarm closer than this many ticks
+#define MAX_ISR_SETPOINTS 8u       // cap curve setpoints emitted per ISR fire: when
+                                   // the consumer can't keep up (curve denser than
+                                   // the ISR can pace), yield instead of spinning
+                                   // the whole curve in one ISR and tripping the
+                                   // interrupt watchdog. The curve then plays at the
+                                   // rate the ISR can sustain (it may lag real time).
 
 // Internal-RAM queue backing store: the consumer reads it from an IRAM-safe ISR,
 // so it must not live in (cached) flash. Static .bss is internal DRAM.
@@ -118,6 +124,7 @@ static void IRAM_ATTR flush_q(void)
 // return; on empty blank the laser and re-arm a short retry. Runs in the ISR.
 static void IRAM_ATTR drain(void)
 {
+    unsigned setpoints = 0;   // curve setpoints emitted this ISR fire (WDT budget)
     for (;;) {
         // A CURVE in flight takes priority: emit exactly ONE interpolated setpoint
         // per timer fire, paced like an implicit DWELL(dt_tick_us). The galvo
@@ -143,6 +150,15 @@ static void IRAM_ATTR drain(void)
                     return;               // safely armed for the next setpoint
                 }
                 // The count passed us during arming: fall through and keep going.
+            }
+            // Behind schedule (or the count passed us): catch up by emitting the
+            // next setpoint now — but only up to a budget per ISR fire. A curve
+            // denser than the ISR can pace (e.g. a long span at low speed) would
+            // otherwise spin the whole curve here and trip the interrupt watchdog.
+            if (++setpoints >= MAX_ISR_SETPOINTS) {
+                s_next_deadline = now_ticks() + MIN_LEAD_TICKS;  // resync; drop backlog
+                arm_at(s_next_deadline);
+                return;
             }
             continue;   // overrun: emit the next setpoint immediately to catch up
         }

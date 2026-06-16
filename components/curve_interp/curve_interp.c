@@ -139,6 +139,20 @@ curve_limits_t curve_default_limits(void) {
     return l;
 }
 
+// clamp(cps * mul / div, 1, VI_MAX), overflow-safe. The physical limit can be far
+// larger than the tick format can hold (huge v_max/a_max, or a large dt) — the true
+// product would overflow int64 — so we detect saturation from the quotient
+// cap/mul and return VI_MAX without ever forming cps*mul. Pre: mul>=1, div>=1,
+// VI_MAX*div fits int64 (div is 1e6 or 1e12; VI_MAX*1e12 ~ 3.3e16 < 9.2e18).
+static int32_t qf_limit(int64_t cps, int64_t mul, int64_t div) {
+    if (cps < 1)  cps = 1;
+    if (mul < 1)  mul = 1;
+    int64_t cap = (int64_t)VI_MAX * div;
+    if (cps >= cap / mul) return VI_MAX;   // cps*mul would reach VI_MAX*div -> clamp
+    int64_t v = cps * mul / div;           // cps*mul < cap, so no overflow
+    return v < 1 ? 1 : (int32_t)v;
+}
+
 void curve_interp_begin(curve_state_t *st, const curve_limits_t *lim,
                         int32_t p0x, int32_t p0y, int32_t p1x, int32_t p1y,
                         int32_t p2x, int32_t p2y, int32_t p3x, int32_t p3y,
@@ -161,27 +175,30 @@ void curve_interp_begin(curve_state_t *st, const curve_limits_t *lim,
     st->done  = false;
 
     // --- precompute the Q(F) tick-domain limits (once, off the hot path) ------
+    // All conversions are overflow-safe: v_max_cps / a_max_cps2 can be astronomically
+    // larger than the tick format holds (and a large dt scales them further), so the
+    // naive products v_max_cps*dt / a_max_cps2*dt^2 would overflow int64. qf_limit()
+    // saturates to VI_MAX in that regime instead. dt is also clamped so dt^2<<F can't
+    // overflow regardless of config.
     int32_t dt = lim->dt_tick_us;
-    if (dt < 1) dt = 1;
+    if (dt < 1)      dt = 1;
+    if (dt > 100000) dt = 100000;   // 100 ms: absurd as a tick, but keeps dt^2<<F safe
 
-    // v_max in whole counts/tick picks F so v = (counts/tick)<<F stays under
-    // VI_MAX. Then v^2 < 2^30 and every kinematic radicand fits int32.
-    int64_t vmax_ct = (lim->v_max_cps * dt) / 1000000;
-    if (vmax_ct < 1) vmax_ct = 1;
+    // Pick F (fractional bits) to maximize speed precision while keeping v_max below
+    // VI_MAX. If even F=0 already saturates (huge v_max_cps, or large dt), there is no
+    // fractional headroom to take and F stays 0. The guard keeps v_max_cps*dt from
+    // overflowing before we know it saturates.
     int32_t F = 0;
-    while (F < VSHIFT_MAX && (vmax_ct << (F + 1)) < VI_MAX) F++;
+    if (lim->v_max_cps < ((int64_t)VI_MAX * 1000000) / dt) {
+        int64_t base = lim->v_max_cps * dt / 1000000;   // < VI_MAX, no overflow
+        if (base < 1) base = 1;
+        while (F < VSHIFT_MAX && (base << (F + 1)) < VI_MAX) F++;
+    }
     st->vshift = F;
 
-    int64_t vmi = (lim->v_max_cps * ((int64_t)dt << F)) / 1000000;
-    if (vmi < 1)      vmi = 1;
-    if (vmi > VI_MAX) vmi = VI_MAX;
-    st->v_max = (int32_t)vmi;
-
-    // a_max in Q(F) counts/tick^2 = a_max_cps2 * dt^2 / 1e12, in Q(F).
-    int64_t ami = ((lim->a_max_cps2 * (int64_t)dt * dt) << F) / 1000000000000LL;
-    if (ami < 1)      ami = 1;
-    if (ami > VI_MAX) ami = VI_MAX;
-    st->a_max = (int32_t)ami;
+    // v_max: Q(F) counts/tick.  a_max: Q(F) counts/tick^2 (= a_max_cps2 * dt^2 / 1e12).
+    st->v_max = qf_limit(lim->v_max_cps,  (int64_t)dt << F,            1000000);
+    st->a_max = qf_limit(lim->a_max_cps2, ((int64_t)dt * dt) << F, 1000000000000LL);
 
     // Wire speed (counts/tick * 256) -> internal Q(F): a shift, no physical math.
     st->v     = wire_to_vi(v_in_wire,  F);
@@ -218,8 +235,13 @@ int64_t curve_speed_cps(const curve_state_t *st, int32_t dt_tick_us) {
 int64_t curve_cps_to_wire(int64_t v_cps, int32_t dt_tick_us) {
     if (v_cps < 0)      v_cps = 0;
     if (dt_tick_us < 1) dt_tick_us = 1;
-    // counts/tick * 256 = v_cps * dt_us / 1e6 * 256, rounded to nearest.
-    int64_t scale = (int64_t)1 << CURVE_WIRE_V_FRAC;
+    // counts/tick * 256 = v_cps * dt_us / 1e6 * 256, rounded to nearest. Saturate
+    // before the product can overflow int64: past VI_MAX counts/tick the
+    // interpolator clamps internally, so the wire need not carry more.
+    if (v_cps >= (int64_t)VI_MAX * 1000000 / dt_tick_us) {
+        return (int64_t)VI_MAX << CURVE_WIRE_V_FRAC;
+    }
+    int64_t scale = (int64_t)1 << CURVE_WIRE_V_FRAC;       // v_cps*dt < VI_MAX*1e6
     return (v_cps * dt_tick_us * scale + 500000) / 1000000;
 }
 
