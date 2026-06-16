@@ -13,11 +13,47 @@
 #include "dacx0004_idf6.h"
 #include "isr_spi.h"
 #include "laser_engine.h"
+#include "curve_interp.h"   // CURVE_DEFAULT_V_MAX_CPS (shared limit contract)
+
+// Networking build config. Pick exactly one WiFi mode when ENABLE_WIFI is set:
+// STA joins an existing AP (phone hotspot), AP stands up our own SoftAP. These
+// gate the includes below, so they must be defined first.
+#define ENABLE_WIFI 1
+#define ENABLE_STA  1
+#define ENABLE_AP   0
+
+#if ENABLE_WIFI
+#if ENABLE_STA == ENABLE_AP
+#error "Select exactly one WiFi mode: set one of ENABLE_STA / ENABLE_AP to 1"
+#endif
+#if ENABLE_STA
+#include "wifi_sta.h"
+// STA: the network we join for UDP tests (a phone hotspot here).
+#define WIFI_STA_SSID  "ioio"
+#define WIFI_STA_PASS  "spicygreen"
+#endif
+#include "udp_echo.h"
+// Port the UDP echo server listens on. Send "Hello World" here to test the link.
+#define UDP_ECHO_PORT  3333
+#if ENABLE_AP
 #include "wifi_ap.h"
+// AP: the network we host. WPA2-PSK needs a >= 8 char password.
+#define WIFI_AP_SSID   "shadowgraph"
+#define WIFI_AP_PASS   "letslaser"
+#endif
+#endif // ENABLE_WIFI
+
+// Networked animation playout (docs/FRAME_STREAMING.md). When enabled, the frame
+// pump becomes the SOLE laser_engine producer, so the local demo renderer below
+// is not started. Needs WiFi up.
+#define ENABLE_FRAME_STREAM 1
+#if ENABLE_FRAME_STREAM
+#include "frame_stream.h"
+#define FRAME_TCP_PORT  7777    // frame data plane  (reliable, bulk)
+#define FRAME_UDP_PORT  7778    // playout clock     (low-latency PLAY{id})
+#endif
 
 static const char *TAG = "shadowgraph";
-
-#define ENABLE_WIFI 0
 
 // ---------------------------------------------------------------------------
 // Galvo SPI bus  (SPI2 / HSPI) — two DAC8871s share the bus
@@ -84,6 +120,38 @@ static const char *TAG = "shadowgraph";
 #define M_PI 3.14159265358979323846
 #endif
 
+// Demo selector. The CURVE demos exercise the curve engine; see docs/CURVE_MOTION.md.
+#define DEMO_LISSAJOUS     0    // legacy point-stream Lissajous (GOTO + DWELL)
+#define DEMO_FIGURE_EIGHT  1    // cubic-native figure-eight (CURVE)
+#define DEMO_SQUARE        2    // large square, ~90% of full range (CURVE)
+#define DEMO_MODE          DEMO_SQUARE
+
+// Figure-eight as a Gerono lemniscate: x = W*sin t, y = (H/2)*sin 2t, t in [0,2pi).
+// Drawn as a chained cubic spline (one CURVE per segment), so the whole figure
+// is ~EIGHT_SEGMENTS*21 bytes on the wire instead of hundreds of GOTOs.
+#define EIGHT_SEGMENTS    64
+#define EIGHT_W           12000.0f   // half-width  (x swing, ~18% of full field)
+#define EIGHT_H           16000.0f   // height param (y swing = H/2)
+
+// Large square (DEMO_SQUARE). Each side spans ~90% of the full DAC range
+// (0..0xFFFF): half-side = 0.45 * 0xFFFF, so corners sit at center +/- this and the
+// figure runs 3278..62258. This deliberately drives the galvos well past the
+// conservative +/-20% linear region the Lissajous demo uses — it is a full-range
+// exercise of the engine and the corner accel/decel limiting.
+#define SQUARE_HALF       29490
+
+// Networking: WiFi station and access point configuration
+// ---------------------------------------------------------------------------
+#if ENABLE_WIFI
+#if ENABLE_STA
+#pragma message("WiFi STA mode enabled")
+#elif ENABLE_AP
+#pragma message("WiFi AP mode enabled")
+#else
+#error "No WiFi mode enabled"
+#endif
+#endif // ENABLE_WIFI
+
 // ---------------------------------------------------------------------------
 // Device handles + interface args
 // ---------------------------------------------------------------------------
@@ -125,6 +193,9 @@ static dacx0004_idf6_arg_t laser_arg = {
     .miso_pin   = -1,
 };
 
+// The local demo renderers below drive the engine directly. They are only built
+// when frame streaming is off (the frame pump is the producer otherwise).
+#if !ENABLE_FRAME_STREAM
 // ---------------------------------------------------------------------------
 // HSV -> 16-bit RGB, with saturation and value fixed at full (S = V = 1).
 // h is in degrees [0, 360).
@@ -148,12 +219,13 @@ static void hsv_to_rgb16(float h, uint16_t *r, uint16_t *g, uint16_t *b)
     *b = (uint16_t)(bf * 0xFFFF);
 }
 
+#if DEMO_MODE == DEMO_LISSAJOUS
 // ---------------------------------------------------------------------------
 // Renderer: trace a morphing Lissajous ("ballywhoop") while slowly cycling the
 // hue. Each point is goto + color + dwell; producer-side calls retry on a full
 // queue (the consumer drains at the dwell rate).
 // ---------------------------------------------------------------------------
-static void render_task(void *arg)
+static void render_lissajous_task(void *arg)
 {
     (void)arg;
 
@@ -187,14 +259,146 @@ static void render_task(void *arg)
         if (hue >= 360.0f) hue -= 360.0f;
     }
 }
+#endif // DEMO_MODE == DEMO_LISSAJOUS
+
+#if DEMO_MODE == DEMO_FIGURE_EIGHT
+// ---------------------------------------------------------------------------
+// Figure-eight position and analytic derivative (Gerono lemniscate).
+// ---------------------------------------------------------------------------
+static void eight_point(float t, float *x, float *y)
+{
+    *x = GALVO_CENTER + EIGHT_W * sinf(t);
+    *y = GALVO_CENTER + 0.5f * EIGHT_H * sinf(2.0f * t);
+}
+static void eight_deriv(float t, float *dx, float *dy)
+{
+    *dx = EIGHT_W * cosf(t);
+    *dy = EIGHT_H * cosf(2.0f * t);   // d/dt[(H/2) sin 2t] = H cos 2t
+}
+
+// ---------------------------------------------------------------------------
+// Renderer: trace a cubic-native figure-eight via LASER_CMD_CURVE, cycling hue.
+// Each segment is a Hermite->Bezier cubic built from the lemniscate's analytic
+// tangents (control point = anchor +/- tangent*dt/3). We hand the firmware
+// v_in=v_out=v_max and let its friction-circle interpolator pick the actual
+// speed (it slows wherever a lobe is tight). A host-side planner (Phase 2) will
+// compute true junction velocities; here the firmware does all the physics.
+// ---------------------------------------------------------------------------
+static void render_eight_task(void *arg)
+{
+    (void)arg;
+    const float two_pi = (float)(2.0 * M_PI);
+    const float dt_par = two_pi / EIGHT_SEGMENTS;     // parameter step per segment
+    // laser_engine_curve wants WIRE units (counts/tick * 256), not counts/s.
+    const uint32_t V   = (uint32_t)curve_cps_to_wire(CURVE_DEFAULT_V_MAX_CPS,
+                                                     CURVE_DEFAULT_DT_TICK_US);
+    float hue = 0.0f;
+    uint16_t r = 0, g = 0, b = 0;
+
+    // Jump (blanked) to the start of the figure, then enable the beam. P0 of the
+    // first CURVE is implicit: this position.
+    float sx, sy;
+    eight_point(0.0f, &sx, &sy);
+    while (!laser_engine_laser(0, 0, 0))                          { vTaskDelay(1); }
+    while (!laser_engine_goto((uint16_t)sx, (uint16_t)sy))        { vTaskDelay(1); }
+
+    for (;;) {
+        hsv_to_rgb16(hue, &r, &g, &b);
+        while (!laser_engine_laser(r, g, b))                     { vTaskDelay(1); }
+
+        for (int i = 0; i < EIGHT_SEGMENTS; i++) {
+            float t0 = i * dt_par, t1 = (i + 1) * dt_par;
+            float p0x, p0y, p3x, p3y, d0x, d0y, d1x, d1y;
+            eight_point(t0, &p0x, &p0y);
+            eight_point(t1, &p3x, &p3y);
+            eight_deriv(t0, &d0x, &d0y);
+            eight_deriv(t1, &d1x, &d1y);
+            // Hermite -> Bezier: tangents scaled by dt_par, control arm = T/3.
+            uint16_t c1x = (uint16_t)(p0x + d0x * dt_par / 3.0f);
+            uint16_t c1y = (uint16_t)(p0y + d0y * dt_par / 3.0f);
+            uint16_t c2x = (uint16_t)(p3x - d1x * dt_par / 3.0f);
+            uint16_t c2y = (uint16_t)(p3y - d1y * dt_par / 3.0f);
+            while (!laser_engine_curve(c1x, c1y, c2x, c2y,
+                                       (uint16_t)p3x, (uint16_t)p3y, V, V)) {
+                vTaskDelay(1);
+            }
+        }
+
+        hue += 2.0f;
+        if (hue >= 360.0f) hue -= 360.0f;
+    }
+}
+#endif // DEMO_MODE == DEMO_FIGURE_EIGHT
+
+#if DEMO_MODE == DEMO_SQUARE
+// ---------------------------------------------------------------------------
+// Renderer: trace a large axis-aligned square via LASER_CMD_CURVE, cycling hue.
+// Each side is a straight (degenerate cubic) CURVE with v_in = v_out = 0, so the
+// interpolator accelerates off each corner and brakes back to rest into the next
+// one — the physically correct way to take a galvo around a 90 deg corner (the
+// direction reverses, so the corner must be a near-stop). Spans ~90% of full scale.
+// ---------------------------------------------------------------------------
+static void render_square_task(void *arg)
+{
+    (void)arg;
+    const int C = GALVO_CENTER, h = SQUARE_HALF;
+    const int corner[4][2] = {
+        { C - h, C - h }, { C + h, C - h }, { C + h, C + h }, { C - h, C + h },
+    };
+    float hue = 0.0f;
+    uint16_t r = 0, g = 0, b = 0;
+
+    // Jump (blanked) to the first corner; P0 of the first CURVE is implicit.
+    while (!laser_engine_laser(0, 0, 0)) { vTaskDelay(1); }
+    while (!laser_engine_goto((uint16_t)corner[0][0], (uint16_t)corner[0][1])) {
+        vTaskDelay(1);
+    }
+
+    for (;;) {
+        hsv_to_rgb16(hue, &r, &g, &b);
+        while (!laser_engine_laser(r, g, b)) { vTaskDelay(1); }
+
+        for (int i = 0; i < 4; i++) {
+            int x0 = corner[i][0],           y0 = corner[i][1];
+            int x3 = corner[(i + 1) % 4][0], y3 = corner[(i + 1) % 4][1];
+            // Straight edge as a cubic with evenly-spaced control points (constant
+            // |B'|). v_in = v_out = 0 -> a clean accel/cruise/decel down each side.
+            uint16_t c1x = (uint16_t)(x0 + (x3 - x0) / 3);
+            uint16_t c1y = (uint16_t)(y0 + (y3 - y0) / 3);
+            uint16_t c2x = (uint16_t)(x0 + 2 * (x3 - x0) / 3);
+            uint16_t c2y = (uint16_t)(y0 + 2 * (y3 - y0) / 3);
+            while (!laser_engine_curve(c1x, c1y, c2x, c2y,
+                                       (uint16_t)x3, (uint16_t)y3, 0, 0)) {
+                vTaskDelay(1);
+            }
+        }
+
+        // hue += 2.0f;
+        // if (hue >= 360.0f) hue -= 360.0f;
+    }
+}
+#endif // DEMO_MODE == DEMO_SQUARE
+#endif // !ENABLE_FRAME_STREAM
 
 void app_main(void)
 {
     #if ENABLE_WIFI
-    // -- Networking: bring up the SoftAP for streaming. Owns NVS / netif /
-    //    event loop, so start it first. --------------------------------------
-    if (!wifi_ap_start()) {
+    // -- Networking: bring up WiFi for streaming. Owns NVS / netif / event
+    //    loop, so start it first. ---------------------------------------------
+    #if ENABLE_STA
+    if (!wifi_sta_start(WIFI_STA_SSID, WIFI_STA_PASS)) {
+        ESP_LOGE(TAG, "wifi_sta_start failed");  // non-fatal: keep tracing
+    }
+    #elif ENABLE_AP
+    if (!wifi_ap_start(WIFI_AP_SSID, WIFI_AP_PASS)) {
         ESP_LOGE(TAG, "wifi_ap_start failed");  // non-fatal: keep tracing
+    }
+    #endif
+
+    // -- UDP echo: smallest end-to-end check that the host can reach us. Send
+    //    "Hello World" to this device on UDP UDP_ECHO_PORT and it bounces back. --
+    if (!udp_echo_start(UDP_ECHO_PORT)) {
+        ESP_LOGE(TAG, "udp_echo_start failed");  // non-fatal: keep tracing
     }
     #endif
 
@@ -261,9 +465,24 @@ void app_main(void)
         ESP_LOGE(TAG, "laser_engine_init failed"); return;
     }
     laser_engine_start();
-    ESP_LOGI(TAG, "laser engine started; tracing ballywhoop at 25%% intensity");
 
     // Renderer on core 1; the gptimer consumer ISR runs on core 0 (where it was
     // installed), so the two don't contend for the same CPU.
-    xTaskCreatePinnedToCore(render_task, "render", 4096, NULL, 5, NULL, 1);
+#if ENABLE_FRAME_STREAM
+    // The frame pump is the single laser_engine producer — no local demo task.
+    if (!frame_stream_start(FRAME_TCP_PORT, FRAME_UDP_PORT)) {
+        ESP_LOGE(TAG, "frame_stream_start failed");
+    }
+    ESP_LOGI(TAG, "laser engine started; frame playout on TCP %d (frames) / UDP %d (clock)",
+             FRAME_TCP_PORT, FRAME_UDP_PORT);
+#elif DEMO_MODE == DEMO_FIGURE_EIGHT
+    ESP_LOGI(TAG, "laser engine started; tracing cubic figure-eight (CURVE)");
+    xTaskCreatePinnedToCore(render_eight_task, "render", 4096, NULL, 5, NULL, 1);
+#elif DEMO_MODE == DEMO_SQUARE
+    ESP_LOGI(TAG, "laser engine started; tracing large square (CURVE)");
+    xTaskCreatePinnedToCore(render_square_task, "render", 4096, NULL, 5, NULL, 1);
+#else
+    ESP_LOGI(TAG, "laser engine started; tracing Lissajous figure at 25%% intensity");
+    xTaskCreatePinnedToCore(render_lissajous_task, "render", 4096, NULL, 5, NULL, 1);
+#endif
 }

@@ -15,11 +15,6 @@
 
 static const char *TAG = "wifi_ap";
 
-// Plain-text on purpose: not security sensitive (see header). WPA2 requires a
-// >= 8 char password; a shorter WIFI_AP_PASS makes the AP fall back to open
-// (no password) with a warning.
-#define WIFI_AP_SSID     "shadowgraph"
-#define WIFI_AP_PASS     "letslaser"
 #define WIFI_AP_CHANNEL  1
 #define WIFI_AP_MAX_CONN 4
 
@@ -52,7 +47,7 @@ static esp_err_t nvs_ready(void)
     return err;
 }
 
-bool wifi_ap_start(void)
+bool wifi_ap_start(const char *ssid, const char *pass)
 {
     esp_err_t err = nvs_ready();
     if (err != ESP_OK) {
@@ -72,20 +67,21 @@ bool wifi_ap_start(void)
 
     wifi_config_t ap_cfg = {
         .ap = {
-            .ssid           = WIFI_AP_SSID,
-            .ssid_len       = strlen(WIFI_AP_SSID),
-            .password       = WIFI_AP_PASS,
+            .ssid_len       = strlen(ssid),
             .channel        = WIFI_AP_CHANNEL,
             .max_connection = WIFI_AP_MAX_CONN,
             .authmode       = WIFI_AUTH_WPA2_PSK,
         },
     };
+    // Copy caller-supplied credentials into the driver's fixed-size fields.
+    strlcpy((char *)ap_cfg.ap.ssid, ssid, sizeof(ap_cfg.ap.ssid));
+    strlcpy((char *)ap_cfg.ap.password, pass, sizeof(ap_cfg.ap.password));
 
     // Honor the configured password only if it's long enough for WPA2;
     // otherwise fall back to an open network so the AP still comes up.
-    if (strlen(WIFI_AP_PASS) < WPA2_MIN_PASS_LEN) {
+    if (strlen(pass) < WPA2_MIN_PASS_LEN) {
         ESP_LOGW(TAG, "password \"%s\" is < %d chars; starting OPEN (no encryption)",
-                 WIFI_AP_PASS, WPA2_MIN_PASS_LEN);
+                 pass, WPA2_MIN_PASS_LEN);
         ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
         ap_cfg.ap.password[0] = '\0';
     }
@@ -95,7 +91,7 @@ bool wifi_ap_start(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "AP up: ssid=\"%s\" channel=%d auth=%s",
-             WIFI_AP_SSID, WIFI_AP_CHANNEL,
+             ssid, WIFI_AP_CHANNEL,
              ap_cfg.ap.authmode == WIFI_AUTH_OPEN ? "open" : "wpa2-psk");
     return true;
 }

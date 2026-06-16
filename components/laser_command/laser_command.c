@@ -9,16 +9,18 @@
 #define IRAM_ATTR
 #endif
 
-#define REC_GOTO   (1 + 2 + 2)       // type + x + y
-#define REC_LASER  (1 + 2 + 2 + 2)   // type + r + g + b
-#define REC_DWELL  (1 + 4)           // type + dt
-#define REC_MAX    REC_LASER
+#define REC_GOTO   (1 + 2 + 2)               // type + x + y
+#define REC_LASER  (1 + 2 + 2 + 2)           // type + r + g + b
+#define REC_DWELL  (1 + 4)                   // type + dt
+#define REC_CURVE  (1 + 2*6 + 4*2)           // type + P1,P2,P3 (u16) + v_in,v_out (u32)
+#define REC_MAX    REC_CURVE
 
 uint32_t IRAM_ATTR laser_command_size(laser_command_type_t type) {
     switch (type) {
         case LASER_CMD_GOTO:  return REC_GOTO;
         case LASER_CMD_LASER: return REC_LASER;
         case LASER_CMD_DWELL: return REC_DWELL;
+        case LASER_CMD_CURVE: return REC_CURVE;
         default:              return 0;
     }
 }
@@ -65,6 +67,74 @@ bool laser_command_push_dwell(byte_queue_t *q, uint32_t dt) {
     return byte_queue_write(q, rec, sizeof rec);
 }
 
+bool laser_command_push_curve(byte_queue_t *q,
+                              uint16_t x1, uint16_t y1,
+                              uint16_t x2, uint16_t y2,
+                              uint16_t x3, uint16_t y3,
+                              uint32_t v_in, uint32_t v_out) {
+    uint8_t rec[REC_CURVE];
+    rec[0] = LASER_CMD_CURVE;
+    put_u16(rec + 1,  x1);
+    put_u16(rec + 3,  y1);
+    put_u16(rec + 5,  x2);
+    put_u16(rec + 7,  y2);
+    put_u16(rec + 9,  x3);
+    put_u16(rec + 11, y3);
+    put_u32(rec + 13, v_in);
+    put_u32(rec + 17, v_out);
+    return byte_queue_write(q, rec, sizeof rec);
+}
+
+// Shared record-body decode: `rec` points at a full record of `type` (size
+// laser_command_size(type)). Fills *out. Used by both the queue pop and the
+// linear-buffer decode so the field layout lives in exactly one place.
+static bool IRAM_ATTR decode_body(laser_command_type_t type, const uint8_t *rec,
+                                  laser_command_t *out) {
+    out->type = type;
+    switch (type) {
+        case LASER_CMD_GOTO:
+            out->pos.x = get_u16(rec + 1);
+            out->pos.y = get_u16(rec + 3);
+            return true;
+        case LASER_CMD_LASER:
+            out->col.r = get_u16(rec + 1);
+            out->col.g = get_u16(rec + 3);
+            out->col.b = get_u16(rec + 5);
+            return true;
+        case LASER_CMD_DWELL:
+            out->dwell.dt = get_u32(rec + 1);
+            return true;
+        case LASER_CMD_CURVE:
+            out->curve.x1    = get_u16(rec + 1);
+            out->curve.y1    = get_u16(rec + 3);
+            out->curve.x2    = get_u16(rec + 5);
+            out->curve.y2    = get_u16(rec + 7);
+            out->curve.x3    = get_u16(rec + 9);
+            out->curve.y3    = get_u16(rec + 11);
+            out->curve.v_in  = get_u32(rec + 13);
+            out->curve.v_out = get_u32(rec + 17);
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool laser_command_decode(const uint8_t *buf, uint32_t len,
+                          laser_command_t *out, uint32_t *consumed) {
+    if (buf == NULL || len < 1) {
+        return false;   // empty
+    }
+    uint32_t size = laser_command_size((laser_command_type_t)buf[0]);
+    if (size == 0 || len < size) {
+        return false;   // unknown type, or only a partial record present
+    }
+    if (!decode_body((laser_command_type_t)buf[0], buf, out)) {
+        return false;
+    }
+    if (consumed) *consumed = size;
+    return true;
+}
+
 bool IRAM_ATTR laser_command_pop(byte_queue_t *q, laser_command_t *out) {
     uint8_t type;
     if (byte_queue_peek(q, &type, 1) < 1) {
@@ -80,21 +150,5 @@ bool IRAM_ATTR laser_command_pop(byte_queue_t *q, laser_command_t *out) {
 
     uint8_t rec[REC_MAX];
     byte_queue_read(q, rec, size);
-    out->type = (laser_command_type_t)type;
-    switch (out->type) {
-        case LASER_CMD_GOTO:
-            out->pos.x = get_u16(rec + 1);
-            out->pos.y = get_u16(rec + 3);
-            return true;
-        case LASER_CMD_LASER:
-            out->col.r = get_u16(rec + 1);
-            out->col.g = get_u16(rec + 3);
-            out->col.b = get_u16(rec + 5);
-            return true;
-        case LASER_CMD_DWELL:
-            out->dwell.dt = get_u32(rec + 1);
-            return true;
-        default:
-            return false;
-    }
+    return decode_body((laser_command_type_t)type, rec, out);
 }
