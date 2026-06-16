@@ -9,6 +9,7 @@ idf_component_register(
         wifi_sta
         wifi_ap
         udp_echo
+        frame_stream
         esp_driver_spi
         esp_driver_gptimer
         log

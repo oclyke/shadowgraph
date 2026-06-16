@@ -61,6 +61,14 @@ bool laser_command_push_curve(byte_queue_t *q,
 // empty or the next record has an unknown type (caller decides how to recover).
 bool laser_command_pop(byte_queue_t *q, laser_command_t *out);
 
+// Decode one record from a linear byte buffer (the same wire format the queue
+// uses), without a queue. On success fills *out, sets *consumed to the record
+// length, and returns true. Returns false if the buffer is empty, holds only a
+// partial record, or starts with an unknown type. Used by the frame pump to
+// replay a frame blob command-by-command.
+bool laser_command_decode(const uint8_t *buf, uint32_t len,
+                          laser_command_t *out, uint32_t *consumed);
+
 #ifdef __cplusplus
 }
 #endif

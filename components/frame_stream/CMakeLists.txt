@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "frame_stream.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        frame_buffer
+        laser_command
+        laser_engine
+        lwip
+        log
+)

@@ -43,6 +43,16 @@
 #endif
 #endif // ENABLE_WIFI
 
+// Networked animation playout (docs/FRAME_STREAMING.md). When enabled, the frame
+// pump becomes the SOLE laser_engine producer, so the local demo renderer below
+// is not started. Needs WiFi up.
+#define ENABLE_FRAME_STREAM 1
+#if ENABLE_FRAME_STREAM
+#include "frame_stream.h"
+#define FRAME_TCP_PORT  7777    // frame data plane  (reliable, bulk)
+#define FRAME_UDP_PORT  7778    // playout clock     (low-latency PLAY{id})
+#endif
+
 static const char *TAG = "shadowgraph";
 
 // ---------------------------------------------------------------------------
@@ -183,6 +193,9 @@ static dacx0004_idf6_arg_t laser_arg = {
     .miso_pin   = -1,
 };
 
+// The local demo renderers below drive the engine directly. They are only built
+// when frame streaming is off (the frame pump is the producer otherwise).
+#if !ENABLE_FRAME_STREAM
 // ---------------------------------------------------------------------------
 // HSV -> 16-bit RGB, with saturation and value fixed at full (S = V = 1).
 // h is in degrees [0, 360).
@@ -365,6 +378,7 @@ static void render_square_task(void *arg)
     }
 }
 #endif // DEMO_MODE == DEMO_SQUARE
+#endif // !ENABLE_FRAME_STREAM
 
 void app_main(void)
 {
@@ -454,7 +468,14 @@ void app_main(void)
 
     // Renderer on core 1; the gptimer consumer ISR runs on core 0 (where it was
     // installed), so the two don't contend for the same CPU.
-#if   DEMO_MODE == DEMO_FIGURE_EIGHT
+#if ENABLE_FRAME_STREAM
+    // The frame pump is the single laser_engine producer — no local demo task.
+    if (!frame_stream_start(FRAME_TCP_PORT, FRAME_UDP_PORT)) {
+        ESP_LOGE(TAG, "frame_stream_start failed");
+    }
+    ESP_LOGI(TAG, "laser engine started; frame playout on TCP %d (frames) / UDP %d (clock)",
+             FRAME_TCP_PORT, FRAME_UDP_PORT);
+#elif DEMO_MODE == DEMO_FIGURE_EIGHT
     ESP_LOGI(TAG, "laser engine started; tracing cubic figure-eight (CURVE)");
     xTaskCreatePinnedToCore(render_eight_task, "render", 4096, NULL, 5, NULL, 1);
 #elif DEMO_MODE == DEMO_SQUARE

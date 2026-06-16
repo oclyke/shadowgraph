@@ -85,23 +85,13 @@ bool laser_command_push_curve(byte_queue_t *q,
     return byte_queue_write(q, rec, sizeof rec);
 }
 
-bool IRAM_ATTR laser_command_pop(byte_queue_t *q, laser_command_t *out) {
-    uint8_t type;
-    if (byte_queue_peek(q, &type, 1) < 1) {
-        return false;   // empty
-    }
-    uint32_t size = laser_command_size((laser_command_type_t)type);
-    if (size == 0) {
-        return false;   // unknown type — corruption guard (record left in place)
-    }
-    if (byte_queue_avail(q) < size) {
-        return false;   // partial record (cannot happen with atomic push)
-    }
-
-    uint8_t rec[REC_MAX];
-    byte_queue_read(q, rec, size);
-    out->type = (laser_command_type_t)type;
-    switch (out->type) {
+// Shared record-body decode: `rec` points at a full record of `type` (size
+// laser_command_size(type)). Fills *out. Used by both the queue pop and the
+// linear-buffer decode so the field layout lives in exactly one place.
+static bool IRAM_ATTR decode_body(laser_command_type_t type, const uint8_t *rec,
+                                  laser_command_t *out) {
+    out->type = type;
+    switch (type) {
         case LASER_CMD_GOTO:
             out->pos.x = get_u16(rec + 1);
             out->pos.y = get_u16(rec + 3);
@@ -127,4 +117,38 @@ bool IRAM_ATTR laser_command_pop(byte_queue_t *q, laser_command_t *out) {
         default:
             return false;
     }
+}
+
+bool laser_command_decode(const uint8_t *buf, uint32_t len,
+                          laser_command_t *out, uint32_t *consumed) {
+    if (buf == NULL || len < 1) {
+        return false;   // empty
+    }
+    uint32_t size = laser_command_size((laser_command_type_t)buf[0]);
+    if (size == 0 || len < size) {
+        return false;   // unknown type, or only a partial record present
+    }
+    if (!decode_body((laser_command_type_t)buf[0], buf, out)) {
+        return false;
+    }
+    if (consumed) *consumed = size;
+    return true;
+}
+
+bool IRAM_ATTR laser_command_pop(byte_queue_t *q, laser_command_t *out) {
+    uint8_t type;
+    if (byte_queue_peek(q, &type, 1) < 1) {
+        return false;   // empty
+    }
+    uint32_t size = laser_command_size((laser_command_type_t)type);
+    if (size == 0) {
+        return false;   // unknown type — corruption guard (record left in place)
+    }
+    if (byte_queue_avail(q) < size) {
+        return false;   // partial record (cannot happen with atomic push)
+    }
+
+    uint8_t rec[REC_MAX];
+    byte_queue_read(q, rec, size);
+    return decode_body((laser_command_type_t)type, rec, out);
 }
