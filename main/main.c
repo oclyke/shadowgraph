@@ -14,11 +14,33 @@
 #include "isr_spi.h"
 #include "laser_engine.h"
 #include "curve_interp.h"   // CURVE_DEFAULT_V_MAX_CPS (shared limit contract)
+
+// Networking build config. Pick exactly one WiFi mode when ENABLE_WIFI is set:
+// STA joins an existing AP (phone hotspot), AP stands up our own SoftAP. These
+// gate the includes below, so they must be defined first.
+#define ENABLE_WIFI 1
+#define ENABLE_STA  1
+#define ENABLE_AP   0
+
+#if ENABLE_WIFI
+#if ENABLE_STA == ENABLE_AP
+#error "Select exactly one WiFi mode: set one of ENABLE_STA / ENABLE_AP to 1"
+#endif
+#if ENABLE_STA
+#include "wifi_sta.h"
+// STA: the network we join for UDP tests (a phone hotspot here).
+#define WIFI_STA_SSID  "ioio"
+#define WIFI_STA_PASS  "spicygreen"
+#endif
+#if ENABLE_AP
 #include "wifi_ap.h"
+// AP: the network we host. WPA2-PSK needs a >= 8 char password.
+#define WIFI_AP_SSID   "shadowgraph"
+#define WIFI_AP_PASS   "letslaser"
+#endif
+#endif // ENABLE_WIFI
 
 static const char *TAG = "shadowgraph";
-
-#define ENABLE_WIFI 0
 
 // ---------------------------------------------------------------------------
 // Galvo SPI bus  (SPI2 / HSPI) — two DAC8871s share the bus
@@ -104,6 +126,18 @@ static const char *TAG = "shadowgraph";
 // conservative +/-20% linear region the Lissajous demo uses — it is a full-range
 // exercise of the engine and the corner accel/decel limiting.
 #define SQUARE_HALF       29490
+
+// Networking: WiFi station and access point configuration
+// ---------------------------------------------------------------------------
+#if ENABLE_WIFI
+#if ENABLE_STA
+#pragma message("WiFi STA mode enabled")
+#elif ENABLE_AP
+#pragma message("WiFi AP mode enabled")
+#else
+#error "No WiFi mode enabled"
+#endif
+#endif // ENABLE_WIFI
 
 // ---------------------------------------------------------------------------
 // Device handles + interface args
@@ -332,11 +366,17 @@ static void render_square_task(void *arg)
 void app_main(void)
 {
     #if ENABLE_WIFI
-    // -- Networking: bring up the SoftAP for streaming. Owns NVS / netif /
-    //    event loop, so start it first. --------------------------------------
-    if (!wifi_ap_start()) {
+    // -- Networking: bring up WiFi for streaming. Owns NVS / netif / event
+    //    loop, so start it first. ---------------------------------------------
+    #if ENABLE_STA
+    if (!wifi_sta_start(WIFI_STA_SSID, WIFI_STA_PASS)) {
+        ESP_LOGE(TAG, "wifi_sta_start failed");  // non-fatal: keep tracing
+    }
+    #elif ENABLE_AP
+    if (!wifi_ap_start(WIFI_AP_SSID, WIFI_AP_PASS)) {
         ESP_LOGE(TAG, "wifi_ap_start failed");  // non-fatal: keep tracing
     }
+    #endif
     #endif
 
     // -- SPI buses (one per DAC group) --------------------------------------
