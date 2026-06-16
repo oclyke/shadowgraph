@@ -44,19 +44,58 @@ fn cubic_d(c: &CubicBez) -> String {
     )
 }
 
-/// Speed fraction -> colour. Slow = red, mid = green, fast (v_max) = blue.
+/// Viridis ramp anchors (slow → fast). Perceptually uniform, colourblind-safe,
+/// and monotone in lightness so speed reads even in greyscale.
+const SPEED_STOPS: [(u8, u8, u8); 5] = [
+    (68, 1, 84),    // 0.00  dark purple — slow / stopped
+    (59, 82, 139),  // 0.25  blue
+    (33, 145, 140), // 0.50  teal
+    (94, 201, 98),  // 0.75  green
+    (253, 231, 37), // 1.00  yellow — v_max
+];
+
+/// Speed fraction (0..1 of v_max) -> colour along the viridis ramp.
 fn heat(frac: f64) -> String {
-    let f = frac.clamp(0.0, 1.0);
-    let r = ((1.0 - f) * 255.0) as u8;
-    let b = (f * 255.0) as u8;
-    let g = ((1.0 - (2.0 * f - 1.0).abs()) * 200.0) as u8;
-    format!("rgb({r},{g},{b})")
+    let f = frac.clamp(0.0, 1.0) * 4.0;
+    let i = (f.floor() as usize).min(3);
+    let t = f - i as f64;
+    let (a, b) = (SPEED_STOPS[i], SPEED_STOPS[i + 1]);
+    let mix = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * t).round() as u8;
+    format!("rgb({},{},{})", mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
 }
 
 fn legend(title: &str) -> String {
     format!(
-        "<text x='400' y='1600' fill='#888' font-size='1400' \
+        "<text x='400' y='1600' fill='#aaa' font-size='1400' \
          font-family='monospace'>{title}</text>"
+    )
+}
+
+/// A labelled colour key for the speed ramp, panelled at the bottom of the frame.
+fn speed_key(lim: &CurveLimits) -> String {
+    let mut grad = String::from(
+        "<defs><linearGradient id='spdkey' x1='0' y1='0' x2='1' y2='0'>",
+    );
+    for (i, (r, g, b)) in SPEED_STOPS.iter().enumerate() {
+        grad += &format!(
+            "<stop offset='{:.2}' stop-color='rgb({r},{g},{b})'/>",
+            i as f64 / 4.0
+        );
+    }
+    grad += "</linearGradient></defs>";
+    format!(
+        "{grad}\
+         <rect x='1800' y='59600' width='37000' height='5200' rx='400' \
+         fill='#000' fill-opacity='0.6' stroke='#555' stroke-width='30'/>\
+         <text x='3000' y='61500' fill='#ddd' font-size='1300' \
+         font-family='monospace'>speed (counts/s)</text>\
+         <rect x='3000' y='62000' width='26000' height='1700' \
+         fill='url(#spdkey)' stroke='#888' stroke-width='30'/>\
+         <text x='3000' y='64400' fill='#ccc' font-size='1050' \
+         font-family='monospace'>0 · slow</text>\
+         <text x='29000' y='64400' fill='#ccc' font-size='1050' \
+         font-family='monospace' text-anchor='end'>v_max {} · fast</text>",
+        lim.v_max_cps
     )
 }
 
@@ -188,7 +227,8 @@ pub fn plan_svg(moves: &[Move], vj: &[f64], lim: &CurveLimits) -> String {
             heat(frac)
         );
     }
-    s += &legend("plan: speed after fwd/bwd passes (red=slow blue=v_max)");
+    s += &speed_key(lim);
+    s += &legend("plan: speed after fwd/bwd passes (dots = junction velocity)");
     s + "</svg>"
 }
 
@@ -225,6 +265,7 @@ pub fn points_svg(pts: &[SimPoint], lim: &CurveLimits) -> String {
             );
         }
     }
+    s += &speed_key(lim);
     s += &legend("points: emitted setpoints, coloured by speed");
     s + "</svg>"
 }

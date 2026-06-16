@@ -49,6 +49,14 @@ typedef struct {
 #define CURVE_DEFAULT_A_MAX_CPS2  ((int64_t)57344000000)  // 2e6  * 28672
 #define CURVE_DEFAULT_DT_TICK_US  ((int32_t)20)
 
+// The default limits as a struct. The CURVE_DEFAULT_* above are preprocessor
+// macros — they don't exist as symbols at link time, so the host tool can't read
+// them directly. This function exposes their values as a real callable symbol the
+// host links over FFI, making curve_interp.h the single source of truth: the host
+// plans/simulates against the EXACT numbers the device uses, nothing mirrored.
+// (Unused by the firmware itself, which uses the macros directly.)
+curve_limits_t curve_default_limits(void);
+
 // Interpolation state for one in-flight CURVE. Opaque in spirit, but exposed so
 // the engine can hold one by value. Read `v` for the current speed (tests do).
 typedef struct {

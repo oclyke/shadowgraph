@@ -86,18 +86,22 @@ walks the stages top to bottom:
 
 | file | what it shows |
 |------|---------------|
+| `0-input.svg` | the input SVG, copied verbatim (the source for the stages below) |
 | `1-parse.svg` | the fitted cubics in their stroke colours |
 | `2-order.svg` | strokes in draw order; blank travel moves dashed grey |
 | `3-segment.svg` | the monotone-κ pieces; **white dots mark every split** |
-| `4-plan.svg` | **velocity after the fwd/bwd passes** — each segment a `v_in→v_out` gradient, and a dot at every control point coloured by its junction speed (red = slow/corner, blue = `v_max`) |
+| `4-plan.svg` | **velocity after the fwd/bwd passes** — each segment a `v_in→v_out` gradient, and a dot at every control point coloured by its junction speed |
 | `5-points.svg` | the **actual emitted setpoints** from the FFI simulation, coloured by real speed — this is what the device draws |
 | `6-profile.svg` | speed vs. arc length, against `v_max` |
 | `6-profile.csv` | one row per setpoint (`t_s, x, y, blank, v_cps, v_frac`) |
 | `7-scene.bin` | the raw `CURVE` wire bytes |
 
-`4-plan.svg` is the one to read for *planned* junction velocities; `5-points.svg`
-shows the *realised* speed (a straight edge reads red→blue→red there as the beam
-accelerates through it and brakes into the next corner).
+Speed is coloured with a **viridis ramp** (dark purple = slow/corner → yellow =
+`v_max`); both `4-plan.svg` and `5-points.svg` carry a labelled colour **key** at
+the bottom of the frame. `4-plan.svg` is the one to read for *planned* junction
+velocities; `5-points.svg` shows the *realised* speed (a straight edge reads
+dark→bright→dark there as the beam accelerates through it and brakes into the next
+corner).
 
 The SVGs open in any browser. On macOS, render one to PNG with:
 
@@ -110,26 +114,38 @@ count, frame time / refresh Hz, and peak v / a / j as a fraction of the limits
 (a `< 30 Hz` note warns when the figure has more path than the galvos can draw
 flicker-free at the current limits).
 
-## Galvo limits (must match the firmware)
+## Galvo limits live in the firmware — not on the command line
 
-These are the whole tuning surface. They must match `CURVE_DEFAULT_*` in
-`components/curve_interp/curve_interp.h` — the device plans against the same
-numbers, and the FFI simulation only stays bit-exact if they agree.
+The galvo limits — max scan speed, max acceleration, and the interpolation tick —
+are **properties of the device, not tool options**. There are no `--v-max-cps`,
+`--a-max-cps2`, or `--dt-tick-us` flags. The tool reads all three from the
+firmware header `components/curve_interp/curve_interp.h` (`CURVE_DEFAULT_*`) over
+FFI, so the plan and the simulation always reflect *exactly* what the device will
+draw — they can never silently disagree.
+
+**To change a limit (e.g. to a faster scanner), edit `curve_interp.h` and rebuild
+both the firmware and this tool.** For example:
+
+```c
+// components/curve_interp/curve_interp.h
+#define CURVE_DEFAULT_V_MAX_CPS   ((int64_t)11468800)     // max scan speed, counts/s
+#define CURVE_DEFAULT_A_MAX_CPS2  ((int64_t)57344000000)  // max accel,      counts/s²
+#define CURVE_DEFAULT_DT_TICK_US  ((int32_t)20)           // interpolation tick (50 kHz)
+```
+
+The current values are placeholders tuned so the example renders ~30 Hz — replace
+`V_MAX`/`A_MAX` with your scanner's real numbers. (See `docs/CURVE_MOTION.md` for
+how a datasheet maps onto them.)
+
+The only knobs the tool *does* expose are host-side choices that don't have to
+match the device:
 
 | flag | unit | meaning |
 |------|------|---------|
-| `--v-max-cps` | counts/s | max scan speed |
-| `--a-max-cps2` | counts/s² | max acceleration (the friction-circle radius) |
-| `--dt-tick-us` | µs | interpolation tick (50 kHz = 20 µs default) |
 | `--corner-dev` | counts | corner rounding (junction deviation): bigger = faster through corners, more rounding |
-| `--amplitude` | counts | field centre→edge (pos = ±1); maps fitted geometry → counts |
+| `--amplitude` | counts | field centre→edge (pos = ±1); how much of the field the drawing fills |
 | `--margin` | 0..1 | field border left around the drawing |
 | `--intensity` | 0..1 | brightness scale on all colours |
-
-The field is `-1..1` per axis (`--amplitude` counts to the edge); the defaults are
-placeholders tuned so the example renders ~30 Hz — replace `--v-max-cps` /
-`--a-max-cps2` with your scanner's real numbers (and update `curve_interp.h` to
-match).
 
 ## How it maps onto the wire
 

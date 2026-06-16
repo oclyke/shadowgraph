@@ -68,6 +68,15 @@ static inline int64_t IRAM_ATTR eval_deriv2(int64_t a, int64_t b, uint64_t t) {
 
 static inline int64_t iabs64(int64_t x) { return x < 0 ? -x : x; }
 
+curve_limits_t curve_default_limits(void) {
+    curve_limits_t l = {
+        CURVE_DEFAULT_V_MAX_CPS,
+        CURVE_DEFAULT_A_MAX_CPS2,
+        CURVE_DEFAULT_DT_TICK_US,
+    };
+    return l;
+}
+
 void curve_interp_begin(curve_state_t *st, const curve_limits_t *lim,
                         int32_t p0x, int32_t p0y, int32_t p1x, int32_t p1y,
                         int32_t p2x, int32_t p2y, int32_t p3x, int32_t p3y,

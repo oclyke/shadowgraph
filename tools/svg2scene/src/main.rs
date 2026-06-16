@@ -43,18 +43,12 @@ struct Args {
     #[arg(long, default_value_t = 28672.0)]
     amplitude: f64,
 
-    // --- galvo limits (must match curve_interp.h on the device) -------------
-    /// Max scan speed (counts/second).
-    #[arg(long, default_value_t = 11_468_800)]
-    v_max_cps: i64,
-    /// Max acceleration (counts/second²).
-    #[arg(long, default_value_t = 57_344_000_000)]
-    a_max_cps2: i64,
-    /// Interpolation tick (µs) — must match the firmware's CURVE_DEFAULT_DT_TICK_US.
-    #[arg(long, default_value_t = 20)]
-    dt_tick_us: i32,
+    // The galvo limits (v_max, a_max, interpolation tick) are NOT flags: they are
+    // properties of the device, read from the firmware (curve_interp.h) over FFI
+    // so the plan/simulation always match what the device draws. To change them,
+    // edit curve_interp.h and rebuild firmware + tool.
     /// Corner rounding (junction deviation) in counts: bigger = faster through
-    /// corners, more rounding.
+    /// corners, more rounding. (Host planning choice, not a galvo limit.)
     #[arg(long, default_value_t = 200.0)]
     corner_dev: f64,
 
@@ -127,11 +121,15 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    let lim = CurveLimits {
-        v_max_cps: args.v_max_cps,
-        a_max_cps2: args.a_max_cps2,
-        dt_tick_us: args.dt_tick_us,
-    };
+    // Limits are the device's, read from the firmware — never set on the host.
+    let lim = CurveLimits::device_default();
+
+    // 0. copy the input verbatim into the bundle, so the source sits alongside
+    // the per-stage views (and the numbering reads start-to-finish).
+    if let Some(p) = bundle("0-input.svg") {
+        std::fs::write(&p, &data)?;
+        eprintln!("wrote {}", p.display());
+    }
 
     // 1. parse + fit
     let raw = parse::parse_svg(&data, &ParseOptions::default())?;

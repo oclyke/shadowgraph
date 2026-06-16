@@ -15,14 +15,18 @@ pub struct CurveLimits {
     pub dt_tick_us: i32,
 }
 
+impl CurveLimits {
+    /// The device's defaults, read straight from the firmware (`curve_interp.h`)
+    /// over FFI — never mirrored or guessed here, so they can't drift.
+    pub fn device_default() -> Self {
+        // SAFETY: trivial value-returning C function, no arguments.
+        unsafe { curve_default_limits() }
+    }
+}
+
 impl Default for CurveLimits {
     fn default() -> Self {
-        // Must match the CURVE_DEFAULT_* macros in curve_interp.h.
-        CurveLimits {
-            v_max_cps: 11_468_800,
-            a_max_cps2: 57_344_000_000,
-            dt_tick_us: 20,
-        }
+        Self::device_default()
     }
 }
 
@@ -50,6 +54,7 @@ struct CurveState {
 }
 
 extern "C" {
+    fn curve_default_limits() -> CurveLimits;
     fn curve_interp_begin(
         st: *mut CurveState,
         lim: *const CurveLimits,
