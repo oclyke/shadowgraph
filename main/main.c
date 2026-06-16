@@ -227,7 +227,9 @@ static void render_eight_task(void *arg)
     (void)arg;
     const float two_pi = (float)(2.0 * M_PI);
     const float dt_par = two_pi / EIGHT_SEGMENTS;     // parameter step per segment
-    const uint32_t V   = (uint32_t)CURVE_DEFAULT_V_MAX_CPS;
+    // laser_engine_curve wants WIRE units (counts/tick * 256), not counts/s.
+    const uint32_t V   = (uint32_t)curve_cps_to_wire(CURVE_DEFAULT_V_MAX_CPS,
+                                                     CURVE_DEFAULT_DT_TICK_US);
     float hue = 0.0f;
     uint16_t r = 0, g = 0, b = 0;
 
@@ -260,8 +262,8 @@ static void render_eight_task(void *arg)
             }
         }
 
-        // hue += 2.0f;
-        // if (hue >= 360.0f) hue -= 360.0f;
+        hue += 2.0f;
+        if (hue >= 360.0f) hue -= 360.0f;
     }
 }
 

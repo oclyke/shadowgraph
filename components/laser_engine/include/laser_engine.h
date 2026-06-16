@@ -54,7 +54,8 @@ bool laser_engine_dwell(uint32_t dt_us);
 
 // Enqueue a cubic Bézier move. P0 is implicit (the engine's current position);
 // P1,P2,P3 are the control points and end (DAC counts). v_in/v_out are the
-// entry/exit speeds in counts/second — the host's planner guarantees the pair is
+// entry/exit speeds in WIRE units (counts per interpolation tick * 256, Q8; see
+// laser_command.h / CURVE_WIRE_V_FRAC) — the host's planner guarantees the pair is
 // reachable over the segment. The engine interpolates the setpoints in the ISR.
 bool laser_engine_curve(uint16_t x1, uint16_t y1,
                         uint16_t x2, uint16_t y2,

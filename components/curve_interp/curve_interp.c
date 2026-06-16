@@ -24,8 +24,8 @@
 //
 // UNITS ARE TICK-NATIVE END TO END. The interpolator never converts to physical
 // units on the hot path:
-//   - in  : begin() takes v_in/v_out in WIRE units (counts/tick, Q16.16) — the
-//           exact CURVE-record format — and only RESCALES Q16 -> Q(F) (a shift).
+//   - in  : begin() takes v_in/v_out in WIRE units (counts/tick * 256, Q8) — the
+//           exact CURVE-record format — and only RESCALES Q8 -> Q(F) (a shift).
 //   - out : step() hands the exit speed back in the same wire units via carry.
 //   - cfg : the physical limits (curve_limits_t, counts/s) are the one human-facing
 //           input; begin() converts them to Q(F) ONCE per curve (off the hot loop).
@@ -54,8 +54,10 @@
 
 #define VI_MAX     32767                 // ceiling for v (Q(F) counts/tick): keeps
                                          // v^2 < 2^30 so all dynamics fit int32.
+                                         // Implies a supported tick range: begin()
+                                         // clamps if v_max_cps*dt_us/1e6 > VI_MAX
+                                         // (i.e. dt beyond a few ms at field speeds).
 #define VSHIFT_MAX 8                     // cap on F so a_max<<F and R<<F stay int32
-#define CPS_SH     20                    // fractional bits of the ->counts/s factor
 
 // Exact integer sqrt of a uint64 (floor). Bit-by-bit, no float. Used only for the
 // wide geometry term |B'| now (1 call/tick instead of 5).
@@ -181,11 +183,7 @@ void curve_interp_begin(curve_state_t *st, const curve_limits_t *lim,
     if (ami > VI_MAX) ami = VI_MAX;
     st->a_max = (int32_t)ami;
 
-    // Reciprocal for the host counts/s readout: v_cps = (v * to_cps_q) >> CPS_SH,
-    // i.e. to_cps_q ~= (1e6 << CPS_SH) / (dt << F).
-    st->to_cps_q = (int32_t)(((int64_t)1000000 << CPS_SH) / ((int64_t)dt << F));
-
-    // Wire speed (counts/tick Q16) -> internal Q(F): a shift, no physical math.
+    // Wire speed (counts/tick * 256) -> internal Q(F): a shift, no physical math.
     st->v     = wire_to_vi(v_in_wire,  F);
     st->v_out = wire_to_vi(v_out_wire, F);
 
@@ -210,8 +208,19 @@ void curve_interp_begin(curve_state_t *st, const curve_limits_t *lim,
     if (st->S < 1) st->S = 1;
 }
 
-int64_t curve_speed_cps(const curve_state_t *st) {
-    return ((int64_t)st->v * st->to_cps_q) >> CPS_SH;
+int64_t curve_speed_cps(const curve_state_t *st, int32_t dt_tick_us) {
+    if (dt_tick_us < 1) dt_tick_us = 1;
+    // v is Q(vshift) counts/tick; counts/s = v / 2^vshift * 1e6 / dt_us. Host-only,
+    // so the int64 divide is fine (never on the ISR path).
+    return ((int64_t)st->v * 1000000) / ((int64_t)dt_tick_us << st->vshift);
+}
+
+int64_t curve_cps_to_wire(int64_t v_cps, int32_t dt_tick_us) {
+    if (v_cps < 0)      v_cps = 0;
+    if (dt_tick_us < 1) dt_tick_us = 1;
+    // counts/tick * 256 = v_cps * dt_us / 1e6 * 256, rounded to nearest.
+    int64_t scale = (int64_t)1 << CURVE_WIRE_V_FRAC;
+    return (v_cps * dt_tick_us * scale + 500000) / 1000000;
 }
 
 bool IRAM_ATTR curve_interp_step(curve_state_t *st, uint16_t *out_x,

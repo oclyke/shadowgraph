@@ -47,7 +47,7 @@ TEST(LaserCommand, CurveRoundTrip) {
         0x1111, 0x2222,            // P1
         0x3333, 0x4444,            // P2
         0x5555, 0x6666,            // P3
-        0x00ABCDEF, 0x00123456));  // v_in, v_out (counts/s)
+        0x00ABCDEF, 0x00123456));  // v_in, v_out (wire speed; opaque to round-trip)
 
     laser_command_t c;
     ASSERT_TRUE(laser_command_pop(&q, &c));

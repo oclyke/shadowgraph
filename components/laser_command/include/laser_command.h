@@ -14,17 +14,18 @@ extern "C" {
 typedef enum {
     LASER_CMD_GOTO  = 0x01,   // x:u16, y:u16     — set galvo position (instantaneous)
     LASER_CMD_LASER = 0x02,   // r:u16, g:u16, b  — set laser color    (instantaneous)
-    LASER_CMD_DWELL = 0x03,   // dt:u32 ticks     — advance time
+    LASER_CMD_DWELL = 0x03,   // dt:u32 µs        — advance time (1 MHz timer ticks)
     LASER_CMD_CURVE = 0x04,   // cubic Bézier move with entry/exit speed (see below)
 } laser_command_type_t;
 
 // LASER_CMD_CURVE: a cubic Bézier segment the engine interpolates in real time.
 //   P0 is IMPLICIT — the engine's current galvo position (end of the previous
 //   command) — so only P1,P2,P3 ride the wire and C0 continuity is automatic.
-//   v_in/v_out are the entry/exit tangential speeds in counts per TICK with 8
-//   fractional bits (value = counts/tick * 256, CURVE_WIRE_V_FRAC) — the
-//   interpolator is tick-native, so no physical units cross the wire (cf. DWELL's
-//   dt, also in ticks). The host's look-ahead guarantees the pair is reachable.
+//   v_in/v_out are the entry/exit tangential speeds in counts per INTERPOLATION
+//   tick (one per dt_tick_us) with 8 fractional bits — value = counts/tick * 256,
+//   CURVE_WIRE_V_FRAC. The interpolator is tick-native, so no physical units cross
+//   the wire. (Note: this is the interpolation tick, NOT DWELL's 1 µs timer tick.)
+//   The host's look-ahead guarantees the (v_in, v_out) pair is reachable.
 //   Colour is NOT carried here: a preceding LASER sets it and it is held (a blank
 //   travel move is LASER 0,0,0 then a straight CURVE). See docs/CURVE_MOTION.md.
 typedef struct {

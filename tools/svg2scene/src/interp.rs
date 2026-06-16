@@ -30,24 +30,23 @@ impl Default for CurveLimits {
     }
 }
 
-/// Fractional bits of the wire speed format (counts/tick * 256). MUST match
-/// `CURVE_WIRE_V_FRAC` in curve_interp.h.
-pub const CURVE_WIRE_V_FRAC: u32 = 8;
-
 /// Convert a planned speed (counts/second) to the wire/firmware format
-/// (counts/tick, 8 fractional bits). The single host-side physical->tick crossing,
-/// shared by `emit` (real wire bytes) and `run_curve` (firmware simulation) so the
-/// two can never disagree.
+/// (counts/tick * 256). Defers to the firmware's `curve_cps_to_wire` over FFI, so
+/// the host and device share one definition of the crossing — used by `emit` (real
+/// wire bytes) and `run_curve` (firmware simulation).
 pub fn cps_to_wire(v_cps: f64, dt_us: i32) -> u32 {
-    let scale = (1u32 << CURVE_WIRE_V_FRAC) as f64;
-    let w = (v_cps.max(0.0) * dt_us as f64 * scale / 1.0e6).round();
-    w.clamp(0.0, u32::MAX as f64) as u32
+    // SAFETY: pure arithmetic C function, no pointers.
+    let w = unsafe { curve_cps_to_wire(v_cps.round() as i64, dt_us) };
+    w.clamp(0, u32::MAX as i64) as u32
 }
 
-/// Mirrors `curve_state_t` exactly (field order + types). Opaque to callers; we
-/// read the current speed via `curve_speed_cps` (the `v*` tail is tick-native).
+/// Mirrors `curve_state_t` exactly (field order + types) so the by-value
+/// allocation size matches. Opaque to callers; we never read these directly —
+/// `curve_speed_cps` does the counts/s readout. Groups match the C struct: shape,
+/// tick-unit limits, evolving state.
 #[repr(C)]
 struct CurveState {
+    // shape
     ax: i64,
     bx: i64,
     cx: i64,
@@ -57,20 +56,18 @@ struct CurveState {
     cy: i64,
     dy: i64,
     s: i64,
-    s_done: i64,
-    t: u64,
     p3x: i32,
     p3y: i32,
-    done: bool,
-    // Tick-native dynamics, Q(vshift) counts/tick (see curve_interp.c). Mirrored so
-    // the by-value allocation size matches the C struct; we never read these
-    // directly (curve_speed_cps does the counts/s readout).
+    // limits (tick units)
     vshift: i32,
-    v: i32,
-    v_out: i32,
     v_max: i32,
     a_max: i32,
-    to_cps_q: i32,
+    v_out: i32,
+    // evolving
+    t: u64,
+    s_done: i64,
+    v: i32,
+    done: bool,
 }
 
 extern "C" {
@@ -95,7 +92,8 @@ extern "C" {
         out_y: *mut u16,
         carry_v_wire: *mut i64,
     ) -> bool;
-    fn curve_speed_cps(st: *const CurveState) -> i64;
+    fn curve_speed_cps(st: *const CurveState, dt_tick_us: i32) -> i64;
+    fn curve_cps_to_wire(v_cps: i64, dt_tick_us: i32) -> i64;
 }
 
 /// One emitted galvo setpoint from the interpolator, plus the exact speed the
@@ -137,7 +135,7 @@ pub fn run_curve(
             let (mut x, mut y, mut c) = (0u16, 0u16, 0i64);
             let going = curve_interp_step(&mut st, &mut x, &mut y, &mut c);
             // Read the speed back in counts/s for reporting (host-only helper).
-            out.push(Setpoint { x, y, v_cps: curve_speed_cps(&st) });
+            out.push(Setpoint { x, y, v_cps: curve_speed_cps(&st, lim.dt_tick_us) });
             *carry = c;
             if !going {
                 break;

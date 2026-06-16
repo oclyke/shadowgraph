@@ -406,10 +406,13 @@ Stages (each independent + testable, with a debug dump — the prior project val
    "consumer in the ISR" architecture (the FPU isn't saved on ISR entry). The
    same fixed-point `curve_interp` TU is linked into the host tool over FFI, so
    the host simulation is bit-exact with the device.
-2. **Wire velocity unit — RESOLVED: `u32` counts/second.** Bandwidth is no longer
-   a concern, so the wire is human-readable integer counts/s; the firmware uses a
-   large internal fixed-point (`Q16.16`, 64-bit intermediates), decoupled from the
-   wire. (Q8.8 / counts-per-µs-as-integer rejected — too coarse / all zeros.)
+2. **Wire velocity unit — RESOLVED: `u32` counts/tick · 256 (Q8).** The interpolator
+   is tick-native, so the wire carries its unit directly — 8 fractional bits = the
+   max internal precision (`vshift ≤ 8`), nothing wasted. The host planner reasons
+   in counts/s and crosses once at `emit` (`cps_to_wire`); counts/s lives only at
+   the human config + reporting edges. (Earlier this was integer counts/s on the
+   wire with a large internal fixed-point — dropped: it forced a per-CURVE
+   physical→tick conversion and a wider, slower ISR format.)
 3. **Firmware autonomy — RESOLVED: one segment at a time.** The host's global
    forward/backward `v²` pass pre-solves feasibility, so the firmware only needs
    the single scalar `v_out` per segment (on the wire) and brakes locally with
