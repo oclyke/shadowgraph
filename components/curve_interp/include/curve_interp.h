@@ -40,7 +40,7 @@ typedef struct {
     int32_t dt_tick_us;    // interpolation period (one ISR tick), microseconds
 } curve_limits_t;
 
-// Placeholder defaults (field v_max=400, a_max=2e6 units/s^2, amplitude 0x7000 =>
+//// Placeholder defaults (field v_max=400, a_max=2e6 units/s^2, amplitude 0x7000 =>
 // 1 field unit = 28672 counts). Replace v_max/a_max with the real galvo
 // datasheet numbers; host and firmware must agree.
 //
@@ -50,9 +50,9 @@ typedef struct {
 // so the tick must stay comfortably above that. Independent of the gptimer's own
 // 1 MHz resolution (used for DWELL scheduling), and above the galvo's mechanical
 // bandwidth at any sane value.
-#define CURVE_DEFAULT_V_MAX_CPS   ((int64_t)11468800)     // 400  * 28672
-#define CURVE_DEFAULT_A_MAX_CPS2  ((int64_t)57344000000)  // 2e6  * 28672
-#define CURVE_DEFAULT_DT_TICK_US  ((int32_t)20)
+#define CURVE_DEFAULT_V_MAX_CPS   ((int64_t)920000000000000000) // you can saturate i64 without any shape issues
+#define CURVE_DEFAULT_A_MAX_CPS2  ((int64_t)2300000000000) // experimental limit, square corner sharpness test
+#define CURVE_DEFAULT_DT_TICK_US  ((int32_t)20) // 50 kHz exceeds the galvo bandwidth
 
 // The default limits as a struct. The CURVE_DEFAULT_* above are preprocessor
 // macros — they don't exist as symbols at link time, so the host tool can't read
