@@ -32,6 +32,9 @@
 #define WIFI_STA_SSID  "ioio"
 #define WIFI_STA_PASS  "spicygreen"
 #endif
+#include "udp_echo.h"
+// Port the UDP echo server listens on. Send "Hello World" here to test the link.
+#define UDP_ECHO_PORT  3333
 #if ENABLE_AP
 #include "wifi_ap.h"
 // AP: the network we host. WPA2-PSK needs a >= 8 char password.
@@ -377,6 +380,12 @@ void app_main(void)
         ESP_LOGE(TAG, "wifi_ap_start failed");  // non-fatal: keep tracing
     }
     #endif
+
+    // -- UDP echo: smallest end-to-end check that the host can reach us. Send
+    //    "Hello World" to this device on UDP UDP_ECHO_PORT and it bounces back. --
+    if (!udp_echo_start(UDP_ECHO_PORT)) {
+        ESP_LOGE(TAG, "udp_echo_start failed");  // non-fatal: keep tracing
+    }
     #endif
 
     // -- SPI buses (one per DAC group) --------------------------------------

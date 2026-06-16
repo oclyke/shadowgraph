@@ -8,6 +8,7 @@ idf_component_register(
         curve_interp
         wifi_sta
         wifi_ap
+        udp_echo
         esp_driver_spi
         esp_driver_gptimer
         log

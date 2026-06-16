@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "udp_echo.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        lwip
+        log
+)

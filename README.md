@@ -36,7 +36,13 @@ shadowgraph/
 │   ├── driver_dacx0004/    # DAC80004 laser driver (ESP-IDF v6 SPI/GPIO wrapper)
 │   ├── byte_queue/         # SPSC lock-free byte ring buffer
 │   ├── laser_command/      # type-value command codec over byte_queue
-│   └── laser_engine/       # command queue + timer-driven DAC consumer
+│   ├── laser_engine/       # command queue + timer-driven DAC consumer
+│   ├── wifi_sta/           # WiFi station bring-up (join an AP / hotspot)
+│   ├── wifi_ap/            # WiFi SoftAP bring-up (host our own network)
+│   └── udp_echo/           # UDP echo server (host ↔ device link check)
+├── tools/
+│   ├── svg2scene/          # SVG → laser scene converter (Rust)
+│   └── udp_echo/           # UDP echo client (Python / click)
 └── third-party/github.com/
     ├── espressif/esp-idf           # pinned ESP-IDF v6.0.1
     ├── oclyke/driver-DAC8871       # vendored galvo driver source
@@ -112,6 +118,50 @@ idf.py fullclean
   (`laser_engine_goto/laser/dwell`). A `gptimer` paces a high-priority consumer
   task that decodes commands and writes the DACs (SPI runs in task context, not
   the ISR). Blanks the laser on underrun for safety.
+- **wifi_sta / wifi_ap** — minimal WiFi bring-up. `wifi_sta` joins an existing
+  access point (a phone hotspot) so the device gets an IP on the host's link;
+  `wifi_ap` stands up our own SoftAP instead. Pick one in `main.c` via the
+  `ENABLE_STA` / `ENABLE_AP` switches.
+- **udp_echo** — a background task that binds a UDP socket and echoes every
+  datagram straight back to the sender. The smallest end-to-end check that the
+  host can reach the device over WiFi. See below.
+
+## Networking & UDP echo
+
+The device brings up WiFi (station mode by default) and starts a UDP echo server
+on port `3333`. On boot the serial log reports the address it was given and that
+the echo server is up:
+
+```
+wifi_sta: got ip: 172.20.10.2
+udp_echo: listening for UDP on port 3333
+```
+
+Note the IP from the `got ip:` line — it is assigned by DHCP and will not always
+be the same. The host must be on the **same network** the device joined (the
+SSID in `main.c`, e.g. a phone hotspot), otherwise packets never arrive even
+though `sendto` reports success.
+
+A matching host-side client lives in `tools/udp_echo/`. It sends a message,
+waits for the echo, and verifies the reply matches (non-zero exit on
+timeout/mismatch, so it doubles as a reachability check):
+
+```sh
+cd tools/udp_echo
+pip install -r requirements.txt          # one-time: installs click
+
+# defaults to message "Hello World" on port 3333
+./udp_echo.py --host 172.20.10.2
+./udp_echo.py --host 172.20.10.2 --port 3333 "ping"
+```
+
+Expected output:
+
+```
+-> 172.20.10.2:3333  'Hello World'
+<- 172.20.10.2:3333  'Hello World'
+echo matched
+```
 
 ## Host unit tests
 
