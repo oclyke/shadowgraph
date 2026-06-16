@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <!-- smooth closed curve (a rounded blob) -->
+  <path d="M40,100 C40,40 160,40 160,100 C160,160 40,160 40,100 Z"
+        fill="none" stroke="#00ff00"/>
+  <!-- sharp-cornered triangle -->
+  <path d="M30,30 L170,30 L100,170 Z" fill="none" stroke="#ff0000"/>
+</svg>

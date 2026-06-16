@@ -335,8 +335,19 @@ Stages (each independent + testable, with a debug dump — the prior project val
   `CURVE` per segment, hue cycling; fed `v_in=v_out=v_max` so the firmware's
   friction-circle interpolator picks the speed. **Full firmware builds clean.**
   *Remaining: flash + observe on hardware (scope galvo / watch the beam).*
-- **Phase 2 — Host tool.** Rebuild `tools/svg2scene` stages 1–8; FFI simulation &
-  viz; limit tests. *Deliverable: SVG → scene.bin that the device draws.*
+- **Phase 2 — Host tool. ✅ DONE (2026-06-15).** `tools/svg2scene` rebuilt:
+  parse(keep cubics)+fit → order/blank (greedy nearest-stroke; lasy dep kept for
+  a later euler-circuit upgrade) → segment (inflections + curvature extrema,
+  near-straight guard) → plan (corner-deviation ∧ curvature junction caps +
+  global fwd/bwd v² look-ahead) → emit CURVE/LASER bytes. **FFI keystone:**
+  `build.rs` compiles `curve_interp.c` into the tool, so `analyze::simulate` is
+  bit-exact with the device. First-class debug bundle (Bazel-style
+  `--debug-output-dir`): parse/order/segment/**plan (velocity-at-control-points
+  after fwd/bwd, gradient + junction dots)**/points (FFI setpoints)/profile +
+  csv + scene.bin. README (repo-root-relative). 5 tests green, 0 warnings
+  (FFI links, CURVE wire layout, junction velocities, end-to-end limits).
+  Example: triangle+blob → 15 curves / 343 bytes, 30.6 Hz, ≤100% v_max/a_max.
+  *Deliverable met: SVG → scene.bin the device can draw.*
 - **Phase 3 — Streaming & polish.** Port the UDP sender; animation (per-frame
   re-plan); 2nd-order interpolation / feedrate-ripple fix; jerk-limited (S-curve)
   envelope; tune limits to the real galvo datasheet.
