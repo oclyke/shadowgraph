@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
-  <!-- smooth closed curve (a rounded blob) -->
-  <path d="M40,100 C40,40 160,40 160,100 C160,160 40,160 40,100 Z"
-        fill="none" stroke="#00ff00"/>
-  <!-- sharp-cornered triangle -->
-  <path d="M30,30 L170,30 L100,170 Z" fill="none" stroke="#ff0000"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+  <!-- a circle (curves -> flattening), a triangle (sharp corners),
+       and a separate line (forces a blank jump) -->
+  <circle cx="70" cy="70" r="50" fill="none" stroke="#ff3030" stroke-width="2"/>
+  <path d="M 130 30 L 180 120 L 90 120 Z" fill="none" stroke="#30c0ff" stroke-width="2"/>
+  <path d="M 20 170 C 70 130, 130 210, 180 170" fill="none" stroke="#40ff60" stroke-width="2"/>
 </svg>
