@@ -15,6 +15,10 @@
                                    // the whole curve in one ISR and tripping the
                                    // interrupt watchdog. The curve then plays at the
                                    // rate the ISR can sustain (it may lag real time).
+#define CATCHUP_REST_US 250u       // min CPU yield when an oversubscribed curve hits
+                                   // the budget above. Must be >> the per-chunk
+                                   // compute so the gptimer ISR can't re-fire back to
+                                   // back and starve the tick (which feeds the WDT).
 
 // Internal-RAM queue backing store: the consumer reads it from an IRAM-safe ISR,
 // so it must not live in (cached) flash. Static .bss is internal DRAM.
@@ -156,7 +160,15 @@ static void IRAM_ATTR drain(void)
             // denser than the ISR can pace (e.g. a long span at low speed) would
             // otherwise spin the whole curve here and trip the interrupt watchdog.
             if (++setpoints >= MAX_ISR_SETPOINTS) {
-                s_next_deadline = now_ticks() + MIN_LEAD_TICKS;  // resync; drop backlog
+                // Oversubscribed: this curve wants setpoints faster than we can emit
+                // while sharing the CPU. Drop the backlog and re-arm a real interval
+                // out (not MIN_LEAD — that's shorter than this chunk's own compute, so
+                // the ISR would re-fire immediately and pin the core, starving the tick
+                // -> interrupt WDT). Normal pacing uses dt_tick; a denser-than-that
+                // curve simply lags instead of bricking the chip.
+                uint32_t rest = (uint32_t)s_curve_lim.dt_tick_us;
+                if (rest < CATCHUP_REST_US) rest = CATCHUP_REST_US;
+                s_next_deadline = now_ticks() + rest;
                 arm_at(s_next_deadline);
                 return;
             }
