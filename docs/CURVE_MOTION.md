@@ -348,9 +348,43 @@ Stages (each independent + testable, with a debug dump — the prior project val
   (FFI links, CURVE wire layout, junction velocities, end-to-end limits).
   Example: triangle+blob → 15 curves / 343 bytes, 30.6 Hz, ≤100% v_max/a_max.
   *Deliverable met: SVG → scene.bin the device can draw.*
-- **Phase 3 — Streaming & polish.** Port the UDP sender; animation (per-frame
-  re-plan); 2nd-order interpolation / feedrate-ripple fix; jerk-limited (S-curve)
-  envelope; tune limits to the real galvo datasheet.
+- **Phase 1.5 — On-device validation (NEXT, needs hardware).** Flash the
+  figure-eight and confirm the curve path works on real optics before building on
+  it: `. ./env.sh && idf.py -p <port> flash monitor`. Expect a smooth continuous
+  8, hue cycling, flicker-free; scope a galvo axis to see the velocity ease at the
+  lobe tips. If it crawls/flickers, the limits are placeholders — see Phase 3.5.
+  This is the one link the host can't verify (the sim is bit-exact, but the
+  galvo's analog response is not modelled).
+
+- **Phase 3 — Streaming & polish.** In rough priority order:
+  1. **UDP sender (headline gap).** The host writes `scene.bin` but nothing sends
+     it — port the sender (framing + per-command seq + redundancy, cf.
+     `tools/stream_scene.py` and the `scene_stream` component) so `SVG → device`
+     is one flow.
+  2. **Animation.** Re-run the pipeline per frame in the SVG domain and stream
+     frames (depends on #1; mind frame-to-frame blanking).
+  3. **Jerk-limited (S-curve) envelope.** Bound `da_t/dt` in `curve_interp` so
+     motion is smooth, not just accel-bounded (jerk is currently reported, not
+     enforced — `j_max` would join the shared limits).
+  4. **2nd-order interpolation.** Add the `B''` term (or a one-step Newton on
+     `t(s)`) to the ISR advance to kill first-order Taylor feedrate ripple.
+  5. **Tune limits to the real galvo datasheet.** Replace the placeholder
+     `CURVE_DEFAULT_*` in `curve_interp.h` with measured numbers (datasheet→params
+     mapping above); host picks them up automatically over FFI.
+
+- **Smaller refinements (any time).**
+  - **`lasy` euler-circuit ordering** to replace the greedy nearest-stroke walk
+    (better draw order + blanking for shared-vertex figures).
+  - **Mid-segment curvature peaks** in junction planning: the host currently sets
+    junction velocities from endpoint curvature and relies on the firmware's
+    per-tick curvature clamp for any interior peak between split points — safe,
+    but a brief unanticipated dip; tighter segmentation or an interior cap would
+    smooth it.
+  - **ISR cost optimisation** if the tick budget gets tight: a clz-seeded Newton
+    `isqrt` and recomputing slowly-varying curvature every Nth tick (see §5.2).
+
+- **Housekeeping.** The whole curve-motion body of work (firmware + tool + docs)
+  is currently uncommitted in the working tree — worth committing before Phase 3.
 
 ## 10. Decisions (resolved 2026-06-15)
 
