@@ -260,8 +260,8 @@ static void render_eight_task(void *arg)
             }
         }
 
-        hue += 2.0f;
-        if (hue >= 360.0f) hue -= 360.0f;
+        // hue += 2.0f;
+        // if (hue >= 360.0f) hue -= 360.0f;
     }
 }
 

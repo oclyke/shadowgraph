@@ -21,8 +21,10 @@ typedef enum {
 // LASER_CMD_CURVE: a cubic Bézier segment the engine interpolates in real time.
 //   P0 is IMPLICIT — the engine's current galvo position (end of the previous
 //   command) — so only P1,P2,P3 ride the wire and C0 continuity is automatic.
-//   v_in/v_out are the entry/exit tangential speeds in DAC counts per second; the
-//   host's global look-ahead guarantees the pair is reachable over the segment.
+//   v_in/v_out are the entry/exit tangential speeds in counts per TICK with 8
+//   fractional bits (value = counts/tick * 256, CURVE_WIRE_V_FRAC) — the
+//   interpolator is tick-native, so no physical units cross the wire (cf. DWELL's
+//   dt, also in ticks). The host's look-ahead guarantees the pair is reachable.
 //   Colour is NOT carried here: a preceding LASER sets it and it is held (a blank
 //   travel move is LASER 0,0,0 then a straight CURVE). See docs/CURVE_MOTION.md.
 typedef struct {
@@ -35,7 +37,7 @@ typedef struct {
             uint16_t x1, y1;                  //   P1 (first control point)
             uint16_t x2, y2;                  //   P2 (second control point)
             uint16_t x3, y3;                  //   P3 (end point = next P0)
-            uint32_t v_in, v_out;             //   entry/exit speed, counts/second
+            uint32_t v_in, v_out;             //   entry/exit speed, counts/tick *256
         } curve;
     };
 } laser_command_t;

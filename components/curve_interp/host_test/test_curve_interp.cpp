@@ -26,13 +26,24 @@ curve_limits_t test_limits() {
     return lim;
 }
 
-// Run a curve to completion, recording one sample per emitted setpoint.
+// Planner speed (counts/s) -> wire format (counts/tick * 256), matching the host's
+// cps_to_wire and what the firmware consumes. v_in/v_out below are given in
+// counts/s for readability; begin() takes wire units.
+int64_t cps_to_wire(int64_t v_cps, int32_t dt_us) {
+    if (v_cps < 0) v_cps = 0;
+    int64_t scale = (int64_t)1 << CURVE_WIRE_V_FRAC;
+    return (v_cps * dt_us * scale + 500000) / 1000000;
+}
+
+// Run a curve to completion, recording one sample per emitted setpoint. Speed is
+// read back in counts/s via curve_speed_cps (the interpolator stores it tick-native).
 std::vector<Sample> run(curve_state_t &st, const curve_limits_t &lim,
                         int p0x, int p0y, int p1x, int p1y,
                         int p2x, int p2y, int p3x, int p3y,
                         int64_t v_in, int64_t v_out, int max_steps = 200000) {
     curve_interp_begin(&st, &lim, p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y,
-                       v_in, v_out);
+                       cps_to_wire(v_in, lim.dt_tick_us),
+                       cps_to_wire(v_out, lim.dt_tick_us));
     std::vector<Sample> out;
     uint16_t x = 0, y = 0;
     int64_t carry = 0;
@@ -40,7 +51,7 @@ std::vector<Sample> run(curve_state_t &st, const curve_limits_t &lim,
     int n = 0;
     while (going && n < max_steps) {
         going = curve_interp_step(&st, &x, &y, &carry);
-        out.push_back({(double)x, (double)y, st.v});
+        out.push_back({(double)x, (double)y, curve_speed_cps(&st)});
         n++;
     }
     EXPECT_LT(n, max_steps) << "curve did not terminate";

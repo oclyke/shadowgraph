@@ -170,7 +170,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     write(bundle("6-profile.csv"), &viz::to_csv(&pts, &lim))?;
 
     // 6. emit
-    let bytes = emit::encode_scene(&moves, &EmitOptions { intensity: args.intensity });
+    let bytes = emit::encode_scene(&moves, &lim, &EmitOptions { intensity: args.intensity });
 
     let vmaxf = lim.v_max_cps as f64;
     let amaxf = lim.a_max_cps2 as f64;

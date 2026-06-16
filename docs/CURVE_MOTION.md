@@ -133,8 +133,8 @@ LASER_CMD_CURVE = 0x04
   P1.x  u16   P1.y  u16        control point 1   (LE, DAC counts, center 0x8000)
   P2.x  u16   P2.y  u16        control point 2
   P3.x  u16   P3.y  u16        end point (= next segment's P0)
-  v_in  u32                    entry speed, counts/second
-  v_out u32                    exit  speed, counts/second
+  v_in  u32                    entry speed, counts/tick * 256 (Q8)
+  v_out u32                    exit  speed, counts/tick * 256 (Q8)
                                total = 1 + 12 + 8 = 21 bytes
 ```
 
@@ -145,20 +145,23 @@ Decisions baked in:
 - **Color is not in `CURVE`.** A preceding `LASER` sets it and it's held — exactly
   like `GOTO` today. A **blank travel move** is `LASER 0,0,0` then a (degenerate,
   straight) `CURVE`. The interpolator is identical for lit and blank moves.
-- **Wire velocity unit = counts/second, `u32`.** Bandwidth is not a constraint in
-  this scheme, so we keep the wire *human-readable* (you literally see
-  `11500000`) with no Q-format to remember; range to 4.3 G, resolution 1 count/s.
-  This is intentionally decoupled from the firmware's *internal* representation
-  (below) — the firmware converts once per command.
-  - *Why not counts/µs or counts/ns on the wire?* As plain integers they'd be
-    useless: v_max ≈ 11.5 counts/µs ≈ 0.0115 counts/ns → ~12 distinct values, or
-    all zeros. Fine time units only help with fractional (Q-format) bits, which is
-    what the internal representation uses; the wire stays integer counts/s.
-- **Internal representation = large fixed-point.** The interpolator computes in
-  `Q16.16` over counts & µs with **64-bit intermediates** (the centripetal `v²`
-  term reaches ~1e14, so 64-bit products are required regardless). Exact formats
-  are finalized in the `curve_interp` implementation with documented overflow
-  headroom.
+- **Wire velocity unit = counts/tick, Q8 (`u32` = counts/tick · 256).** The
+  interpolator is *tick-native* (below), so the wire carries the same unit it runs
+  in — no physical units cross the firmware boundary (cf. `DWELL`'s `dt`, also
+  ticks). 8 fractional bits = the interpolator's max internal precision, so the
+  wire holds exactly what the firmware can represent: wire→internal is a pure right
+  shift, nothing converted or wasted. The host planner reasons in counts/s and
+  crosses to this format once, at `emit` (`cps_to_wire`).
+  - *Why not counts/second on the wire?* It would force a physical→tick conversion
+    in the firmware on every CURVE. Ticks keep the whole path (planner→wire→ISR)
+    in one unit; counts/s lives only at the human-facing config + reporting edges.
+  - *Why only 8 fractional bits, not Q16.16?* The ISR keeps ≤8 fractional bits
+    (`vshift`); extra wire bits would just be discarded on arrival.
+- **Internal representation = small fixed-point (counts, ticks).** The interpolator
+  carries speed/accel as `Q(vshift)` counts/tick (≤8 frac bits), so a step is one
+  tick (no `·Δτ` divide) and `v²` + the kinematic radicands fit **int32** (32-bit
+  sqrt/divide). Only the wide curve geometry (`|B'|`, `R`) stays 64-bit. See
+  curve_interp.c "NUMBER FORMAT" for the overflow headroom.
 - **Limits (`v_max`, `a_max`, `δ`, `Δτ`) are NOT on the wire.** They are galvo
   properties living in a shared config header (§5.3); the host CLI mirrors them
   and a test asserts host/firmware agree. (Future: a `CONFIG` command to push
@@ -172,23 +175,26 @@ is the single source of truth for "what does a `CURVE` actually draw."
 ### 5.1 Public API (sketch)
 ```c
 typedef struct {            // immutable galvo limits (shared config, §5.3)
-    int32_t v_max;          // counts/s
-    int32_t a_max;          // counts/s²
-    int32_t dt_tick_us;     // interpolation period Δτ
+    int64_t v_max_cps;      // counts/s   (human-facing physical units)
+    int64_t a_max_cps2;     // counts/s²
+    int32_t dt_tick_us;     // interpolation period Δτ (the tick duration)
 } curve_limits_t;
 
-typedef struct { /* fixed-point coeffs, arc length S, s_done, t, v, ... */ } curve_state_t;
+// Tick-native state: speed is Q(vshift) counts/tick; begin() converts the physical
+// limits + the wire speed ONCE. curve_speed_cps() reads it back in counts/s.
+typedef struct { /* coeffs, S, s_done, t; vshift, v, v_out, v_max, a_max, ... */ } curve_state_t;
 
-// Once per CURVE: expand control points to Horner coeffs, integrate arc length S.
+// Once per CURVE: expand control points to Horner coeffs, integrate arc length S,
+// convert the limits to tick units. v_in/v_out are WIRE units (counts/tick · 256).
 void curve_interp_begin(curve_state_t *st, const curve_limits_t *lim,
                         int32_t p0x,int32_t p0y, int32_t p1x,int32_t p1y,
                         int32_t p2x,int32_t p2y, int32_t p3x,int32_t p3y,
-                        int32_t v_in_cps, int32_t v_out_cps);   // wire unit: counts/s
+                        int64_t v_in_wire, int64_t v_out_wire);
 
 // One ISR tick: advance Δτ, output next setpoint. Returns false when t≥1 (done);
-// *carry_v receives the speed to hand to the next segment.
+// *carry_v_wire receives the exit speed (wire units) to hand to the next segment.
 bool curve_interp_step(curve_state_t *st, uint16_t *out_x, uint16_t *out_y,
-                       int32_t *carry_v);
+                       int64_t *carry_v_wire);
 ```
 
 ### 5.2 The per-tick algorithm
@@ -217,8 +223,16 @@ Notes:
   arbitrary t. (Forward differencing is only for fixed parameter steps.)
 - 1st-order Taylor causes mild feedrate ripple; a 2nd-order term or a one-step
   Newton on `t(s)` removes it — Phase 2 polish if scope/ripple warrants.
-- A few 32×32→64 mults and ~3 integer sqrts + ~6 int64 divides per tick. Measured
-  budget is ~8–12 µs/setpoint (math + 2 galvo SPI writes), so the default tick is
+- **Tick-native dynamics, Q(vshift) counts/tick**, not (counts, seconds): the
+  whole state is in tick units (`begin()` converts the physical limits + wire speed
+  once). One step is exactly one tick, so every per-tick `·Δτ/1e6` becomes a shift,
+  not a divide, and `v`, `v²`, and the kinematic radicands fit **int32** — the four
+  kinematic roots use `isqrt32` and the friction-circle ratio is a 32-bit divide.
+  Only the wide geometry (`|B'|`, `R = |B'|³/|B'×B''|`, `Δt = Δs/|B'|`) stays
+  64-bit: ~1 `isqrt64` + 2 int64 divides per tick, down from ~5 `isqrt64` + ~8
+  int64 divides. The ISR never touches physical units; `curve_speed_cps()` is a
+  host-only counts/s readout for reporting/tests. Measured budget is ~8–12
+  µs/setpoint (math + 2 galvo SPI writes), so the default tick is
   **Δτ = 20 µs (50 kHz)** for headroom. The gptimer stays at 1 MHz for DWELL
   scheduling resolution — independent of Δτ. 1 MHz interpolation is infeasible
   (ISR can't execute in 1 µs, and the galvo can't track it).
