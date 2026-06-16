@@ -336,8 +336,8 @@ Stages (each independent + testable, with a debug dump — the prior project val
   friction-circle interpolator picks the speed. **Full firmware builds clean.**
   *Remaining: flash + observe on hardware (scope galvo / watch the beam).*
 - **Phase 2 — Host tool. ✅ DONE (2026-06-15).** `tools/svg2scene` rebuilt:
-  parse(keep cubics)+fit → order/blank (greedy nearest-stroke; lasy dep kept for
-  a later euler-circuit upgrade) → segment (inflections + curvature extrema,
+  parse(keep cubics)+fit → order/blank (lasy euler circuit over knots + greedy
+  stroke reorder for travel) → segment (inflections + curvature extrema,
   near-straight guard) → plan (corner-deviation ∧ curvature junction caps +
   global fwd/bwd v² look-ahead) → emit CURVE/LASER bytes. **FFI keystone:**
   `build.rs` compiles `curve_interp.c` into the tool, so `analyze::simulate` is
@@ -373,8 +373,11 @@ Stages (each independent + testable, with a debug dump — the prior project val
      mapping above); host picks them up automatically over FFI.
 
 - **Smaller refinements (any time).**
-  - **`lasy` euler-circuit ordering** to replace the greedy nearest-stroke walk
-    (better draw order + blanking for shared-vertex figures).
+  - ~~`lasy` euler-circuit ordering~~ ✅ DONE — `order.rs` now runs lasy's euler
+    circuit over the cubic knots (each lit line drawn once, no retracing) then
+    greedily reorders the resulting strokes to cut travel between disjoint ones.
+    Hybrid: lasy for within-component traversal, greedy for between-component
+    travel (lasy alone minimises blank *count* + angle, not travel distance).
   - **Mid-segment curvature peaks** in junction planning: the host currently sets
     junction velocities from endpoint curvature and relies on the firmware's
     per-tick curvature clamp for any interior peak between split points — safe,

@@ -22,7 +22,7 @@ Each stage is independent and gets its own debug visualization (below).
 | stage | module | in → out |
 |-------|--------|----------|
 | parse + fit | `parse.rs` | SVG → coloured **cubics**, fitted to DAC counts (`usvg` + `kurbo`, y-up) |
-| order + blank | `order.rs` | greedy nearest-stroke draw order; blank travel moves between strokes |
+| order + blank | `order.rs` | `lasy` euler-circuit traversal (each lit line drawn once) + greedy nearest-stroke reorder for travel; blank moves between strokes |
 | segment | `segment.rs` | split cubics at inflections + curvature extrema → monotone-κ pieces |
 | plan | `plan.rs` | junction velocities (corner-deviation ∧ curvature) + global fwd/bwd `v²` look-ahead → feasible `v_in/v_out` |
 | emit | `emit.rs` | moves → `LASER`/`CURVE` wire bytes (matches `components/laser_command`) |
@@ -172,7 +172,10 @@ end-to-end run whose **simulated motion stays within the galvo limits**.
   absolute path geometry with per-path colour.
 - **`kurbo`** — cubic Béziers with arc length, curvature, derivatives,
   inflections, and subdivision (the segmentation + planning math).
-- **`lasy`** (nannou) — kept as a dependency for a future euler-circuit draw-order
-  upgrade; v1 ordering is a greedy nearest-stroke walk.
+- **`lasy`** (nannou) — euler-circuit draw-order optimisation: it traverses
+  connected/shared-vertex geometry drawing each lit line exactly once (no
+  retracing) and inserts the minimal blanks. Fed the cubic *knot* points only
+  (never flattening the curves); the result is then greedily reordered to cut
+  travel between disjoint strokes.
 - **`cc`** (build) — compiles the firmware's `curve_interp.c` for the bit-exact
   FFI simulation.
