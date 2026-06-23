@@ -31,7 +31,7 @@ static const char *TAG = "shadowgraph";
 #define SCENE_TCP_PORT  7777
 // WiFi role: 1 = join the "ioio" network as a station (device + host share that
 // LAN; stream to the DHCP IP logged at boot); 0 = host our own SoftAP.
-#define WIFI_STA_MODE   1
+#define WIFI_STA_MODE   0
 
 // Art-Net control fixture: the DMX universe we listen on and the 1-based slot of
 // its first channel (see components/artnet_control for the channel map).
