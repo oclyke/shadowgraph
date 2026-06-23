@@ -15,6 +15,11 @@ static point_ring_t       s_ring;
 static laser_engine_cfg_t s_cfg;
 static gptimer_handle_t   s_timer;
 
+// Count of ticks that found the ring empty (producer fell behind). Written only
+// by the ISR, read by any task; a free-running counter so a torn read is at
+// worst off by one and the trend is what matters.
+static volatile uint32_t  s_underruns;
+
 // ---------------------------------------------------------------------------
 // DAC wire encoders: build the exact bytes the drivers would send, inline, so
 // the ISR never calls the flash-resident, blocking driver cores.
@@ -74,6 +79,7 @@ static bool IRAM_ATTR on_alarm(gptimer_handle_t timer,
 
     laser_point_t p;
     if (!point_ring_pop(&s_ring, &p)) {
+        s_underruns++;          // producer fell behind this tick
         blank_laser();          // underrun: hold last galvo position, beam off
         return false;
     }
@@ -145,4 +151,7 @@ bool laser_engine_point(const laser_point_t *p) {
 }
 uint32_t laser_engine_points(const laser_point_t *pts, uint32_t n) {
     return point_ring_push_bulk(&s_ring, pts, n);
+}
+uint32_t laser_engine_underruns(void) {
+    return s_underruns;
 }

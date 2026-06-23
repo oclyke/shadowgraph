@@ -81,7 +81,12 @@ static const char *TAG = "shadowgraph";
 #define HUE_RATE_DEG_S    50.0f     // color cycling (~7.2 s per full wheel)
 
 #define LASER_INTENSITY   0.25f     // 25% of full scale
-#define COLOR_EVERY       16        // refresh laser color every N points
+
+// The figure is precomputed into a frame buffer (no per-point trig on the hot
+// path) and re-evaluated only every N displayed loops, so the slow morph/hue
+// drift costs ~30 Hz of sinf work instead of POINT_RATE_HZ. At 256 pts/loop and
+// ~117 Hz redraw, 4 loops ~= 34 ms ~= 30 Hz rebuild: visually continuous.
+#define FRAMES_PER_REBUILD 4
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -151,29 +156,26 @@ static void hsv_to_rgb8(float h, uint8_t *r, uint8_t *g, uint8_t *b)
     *b = (uint8_t)(bf * 0xFF);
 }
 
-// ---------------------------------------------------------------------------
-// Renderer: trace a morphing Lissajous ("ballywhoop") while slowly cycling the
-// hue. Each point carries its position and color; the engine consumes one point
-// per tick at POINT_RATE_HZ. Producer-side push retries on a full ring.
-// ---------------------------------------------------------------------------
-static void render_task(void *arg)
-{
-    (void)arg;
+// One precomputed loop of the figure, in internal DRAM. The hot path bulk-copies
+// this into the ring with no trig and no flash access; all sinf/HSV work happens
+// off the critical path in build_frame at the (much lower) rebuild cadence.
+static laser_point_t s_frame[POINTS_PER_LOOP];
 
+// Evaluate the morphing Lissajous for the current phase/hue into s_frame. Called
+// once per FRAMES_PER_REBUILD displayed loops, so its sinf cost is ~30 Hz, not
+// per output point. Color is constant within a frame (the hue drift per rebuild
+// is small), which matches the old per-16-point color quantization.
+static void build_frame(float phase, float hue)
+{
     const float two_pi = (float)(2.0 * M_PI);
     const float t_step = two_pi / POINTS_PER_LOOP;
-    float t = 0.0f, phase = 0.0f, hue = 0.0f;
-    int color_div = 0;
-    uint8_t r = 0, g = 0, b = 0;
 
-    for (;;) {
-        // Recompute the slowly-drifting color only every COLOR_EVERY points to
-        // keep the float work down at the high point rate; the value still
-        // travels with every point.
-        if (color_div == 0) hsv_to_rgb8(hue, &r, &g, &b);
-        if (++color_div >= COLOR_EVERY) color_div = 0;
+    uint8_t r, g, b;
+    hsv_to_rgb8(hue, &r, &g, &b);
 
-        laser_point_t p = {
+    for (int i = 0; i < POINTS_PER_LOOP; i++) {
+        const float t = i * t_step;
+        s_frame[i] = (laser_point_t){
             .x      = (int16_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FX * t)),
             .y      = (int16_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FY * t + phase)),
             .status = 0,
@@ -181,14 +183,59 @@ static void render_task(void *arg)
             .g      = g,
             .b      = b,
         };
-        while (!laser_engine_point(&p)) { vTaskDelay(1); }
+    }
+}
 
-        t += t_step;
-        if (t >= two_pi) t -= two_pi;
-        phase += MORPH_RATE_RAD_S * POINT_PERIOD_S;
+// ---------------------------------------------------------------------------
+// Renderer: trace a morphing Lissajous ("ballywhoop") while slowly cycling the
+// hue. The figure is precomputed into s_frame and bulk-pushed repeatedly; the
+// morph/hue are advanced and the frame rebuilt only every FRAMES_PER_REBUILD
+// displayed loops, decoupling the cheap display path from the trig work.
+// ---------------------------------------------------------------------------
+static void render_task(void *arg)
+{
+    (void)arg;
+
+    const float two_pi = (float)(2.0 * M_PI);
+    float phase = 0.0f, hue = 0.0f;
+
+    build_frame(phase, hue);
+
+    for (;;) {
+        // Display the current frame FRAMES_PER_REBUILD times. Each push is a bulk
+        // ring write of a DRAM buffer; retry only the tail that didn't fit.
+        for (int f = 0; f < FRAMES_PER_REBUILD; f++) {
+            uint32_t pushed = 0;
+            while (pushed < POINTS_PER_LOOP) {
+                pushed += laser_engine_points(s_frame + pushed, POINTS_PER_LOOP - pushed);
+                if (pushed < POINTS_PER_LOOP) vTaskDelay(1);   // ring full: drain
+            }
+        }
+
+        // Advance the animation by the wall-clock time those loops took, then
+        // re-evaluate the figure for the new phase/hue.
+        const float dt = FRAMES_PER_REBUILD * POINTS_PER_LOOP * POINT_PERIOD_S;
+        phase += MORPH_RATE_RAD_S * dt;
         if (phase >= two_pi) phase -= two_pi;
-        hue += HUE_RATE_DEG_S * POINT_PERIOD_S;
+        hue += HUE_RATE_DEG_S * dt;
         if (hue >= 360.0f) hue -= 360.0f;
+        build_frame(phase, hue);
+    }
+}
+
+// Low-priority watchdog on producer health: log the engine's underrun count
+// once a second. A rising delta means render_task can't keep the ring full at
+// POINT_RATE_HZ and the beam is being blanked on empty ticks (visible flicker).
+static void underrun_log_task(void *arg)
+{
+    (void)arg;
+    uint32_t last = laser_engine_underruns();
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        uint32_t now = laser_engine_underruns();
+        ESP_LOGI(TAG, "underruns: %lu (+%lu/s)",
+                 (unsigned long)now, (unsigned long)(now - last));
+        last = now;
     }
 }
 
@@ -270,4 +317,7 @@ void app_main(void)
     // Renderer on core 1; the gptimer consumer ISR runs on core 0 (where it was
     // installed), so the two don't contend for the same CPU.
     xTaskCreatePinnedToCore(render_task, "render", 4096, NULL, 5, NULL, 1);
+
+    // Diagnostics: report underruns once a second at low priority.
+    xTaskCreate(underrun_log_task, "underrun", 2048, NULL, 1, NULL);
 }

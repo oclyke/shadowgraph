@@ -55,6 +55,11 @@ void laser_engine_start(void);
 bool     laser_engine_point (const laser_point_t *p);
 uint32_t laser_engine_points(const laser_point_t *pts, uint32_t n);
 
+// Free-running count of timer ticks that found the ring empty (the producer fell
+// behind and the beam was blanked for that tick). A rising count means the
+// renderer can't keep up with point_rate_hz.
+uint32_t laser_engine_underruns(void);
+
 #ifdef __cplusplus
 }
 #endif
