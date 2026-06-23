@@ -1,0 +1,19 @@
+[package]
+name = "svg2scene"
+version = "0.3.0"
+edition = "2021"
+description = "Convert SVG artwork into an ILDA-style galvo laser point stream"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+usvg = "0.47"
+kurbo = "0.13"
+lasy = "0.4"
+
+[[bin]]
+name = "svg2scene"
+path = "src/main.rs"
+
+[lib]
+name = "svg2scene"
+path = "src/lib.rs"

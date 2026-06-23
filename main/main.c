@@ -1,7 +1,7 @@
-// shadowgraph demo: trace a morphing Lissajous "ballywhoop" on the galvos while
-// slowly cycling the laser color through the HSV hue wheel at 25% intensity.
-// Exercises the full laser_engine path end to end: the point ring, the
-// fixed-rate timer ISR consumer, and galvo + laser DAC writes.
+// shadowgraph: drive the galvos + laser from an ILDA-style point stream. By
+// default the device brings up its SoftAP and a TCP scene receiver, then loops
+// whatever scene the host last streamed (see tools/svg2scene --stream). A
+// compile-time fallback (RENDER_DEMO) traces a built-in Lissajous instead.
 #include <math.h>
 
 #include "freertos/FreeRTOS.h"
@@ -13,11 +13,19 @@
 #include "dacx0004_idf6.h"
 #include "isr_spi.h"
 #include "laser_engine.h"
+#include "point_stream.h"
 #include "wifi_ap.h"
 
 static const char *TAG = "shadowgraph";
 
-#define ENABLE_WIFI 0
+// Scene source: 0 = stream scenes over TCP (needs WiFi); 1 = built-in Lissajous
+// demo (offline fallback, no networking).
+#define RENDER_DEMO     0
+#define SCENE_TCP_PORT  7777
+#define ENABLE_WIFI     (!RENDER_DEMO)
+// WiFi role: 1 = join the "ioio" network as a station (device + host share that
+// LAN; stream to the DHCP IP logged at boot); 0 = host our own SoftAP.
+#define WIFI_STA_MODE   1
 
 // ---------------------------------------------------------------------------
 // Galvo SPI bus  (SPI2 / HSPI) — two DAC8871s share the bus
@@ -55,42 +63,29 @@ static const char *TAG = "shadowgraph";
 #define LASER_CH_BLUE    DACX0004_ADD_C
 
 // ---------------------------------------------------------------------------
-// Demo parameters
+// Engine parameters
 // ---------------------------------------------------------------------------
 #define GALVO_CENTER      0x8000    // raw DAC8871 mid-scale (zero deflection),
                                     // used only to prime the devices at startup
+#define POINT_RATE_HZ     30000     // ILDA "30K" sample rate (engine cadence)
 
-// Points are ILDA-signed (center 0, +/-32767 full scale); the engine maps them
-// to galvo DAC codes. Stay within +/-20% of full peak-to-peak travel to keep the
-// galvos in their linear region: 0.20 * 65535 ~= 13107 (same LSB as the DAC code,
-// only the origin shifts, so the physical deflection matches the old code space).
+#if RENDER_DEMO
+// Lissajous "ballywhoop" demo parameters (offline fallback). Points are ILDA-
+// signed (center 0); stay within ~±20% of full travel to keep the galvos linear
+// (0.20 * 65535 ~= 13107).
 #define GALVO_AMPLITUDE   13107
-
-// "Ballywhoop": a 3:2 Lissajous figure whose y-axis phase precesses slowly, so
-// the figure continuously morphs.
 #define LISSAJOUS_FX      3.0f
 #define LISSAJOUS_FY      2.0f
 #define POINTS_PER_LOOP   256
-#define POINT_RATE_HZ     30000     // ILDA "30K" sample rate; 256 pts -> ~117 Hz
-                                    // redraw: well above flicker fusion
 #define POINT_PERIOD_S    (1.0f / POINT_RATE_HZ)
-
-// Background animation rates in wall-clock units, so morph/color speed stay
-// constant regardless of the point rate.
 #define MORPH_RATE_RAD_S  1.0f      // y-phase precession (~6 s per full morph)
 #define HUE_RATE_DEG_S    50.0f     // color cycling (~7.2 s per full wheel)
-
 #define LASER_INTENSITY   0.25f     // 25% of full scale
-
-// The figure is precomputed into a frame buffer (no per-point trig on the hot
-// path) and re-evaluated only every N displayed loops, so the slow morph/hue
-// drift costs ~30 Hz of sinf work instead of POINT_RATE_HZ. At 256 pts/loop and
-// ~117 Hz redraw, 4 loops ~= 34 ms ~= 30 Hz rebuild: visually continuous.
-#define FRAMES_PER_REBUILD 4
-
+#define FRAMES_PER_REBUILD 4        // rebuild the morph every N loops (~30 Hz)
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+#endif // RENDER_DEMO
 
 // ---------------------------------------------------------------------------
 // Device handles + interface args
@@ -133,6 +128,7 @@ static dacx0004_idf6_arg_t laser_arg = {
     .miso_pin   = -1,
 };
 
+#if RENDER_DEMO
 // ---------------------------------------------------------------------------
 // HSV -> 8-bit RGB (ILDA color depth), with saturation and value fixed at full
 // (S = V = 1). h is in degrees [0, 360).
@@ -223,6 +219,37 @@ static void render_task(void *arg)
     }
 }
 
+#else // !RENDER_DEMO
+
+// ---------------------------------------------------------------------------
+// Renderer: loop the active streamed scene. point_stream_get hands back the
+// latest published scene (held in internal DRAM); we bulk-push it into the ring
+// on repeat. Pushing only from the DRAM scene buffer keeps flash off the hot
+// path (cf. the sin-LUT stall). Until the first scene arrives the ring drains
+// and the engine blanks — safe: galvo centered, beam dark. A new scene swaps in
+// seamlessly between whole loops.
+// ---------------------------------------------------------------------------
+static void render_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        const laser_point_t *pts = NULL;
+        uint32_t n = 0;
+        if (!point_stream_get(&pts, &n) || n == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));   // idle: no scene yet
+            continue;
+        }
+        // Display one full loop of the scene; retry only the tail that didn't fit.
+        uint32_t pushed = 0;
+        while (pushed < n) {
+            pushed += laser_engine_points(pts + pushed, n - pushed);
+            if (pushed < n) vTaskDelay(1);   // ring full: let it drain
+        }
+    }
+}
+
+#endif // RENDER_DEMO
+
 // Low-priority watchdog on producer health: log the engine's underrun count
 // once a second. A rising delta means render_task can't keep the ring full at
 // POINT_RATE_HZ and the beam is being blanked on empty ticks (visible flicker).
@@ -242,11 +269,18 @@ static void underrun_log_task(void *arg)
 void app_main(void)
 {
     #if ENABLE_WIFI
-    // -- Networking: bring up the SoftAP for streaming. Owns NVS / netif /
-    //    event loop, so start it first. --------------------------------------
+    // -- Networking: bring up WiFi for streaming. Owns NVS / netif / event loop,
+    //    so start it first. STA joins "ioio" (IP logged on join); AP hosts our
+    //    own network. ----------------------------------------------------------
+    #if WIFI_STA_MODE
+    if (!wifi_sta_start()) {
+        ESP_LOGE(TAG, "wifi_sta_start failed");  // non-fatal: keep tracing
+    }
+    #else
     if (!wifi_ap_start()) {
         ESP_LOGE(TAG, "wifi_ap_start failed");  // non-fatal: keep tracing
     }
+    #endif
     #endif
 
     // -- SPI buses (one per DAC group) --------------------------------------
@@ -312,7 +346,16 @@ void app_main(void)
         ESP_LOGE(TAG, "laser_engine_init failed"); return;
     }
     laser_engine_start();
-    ESP_LOGI(TAG, "laser engine started; tracing ballywhoop at 25%% intensity");
+    ESP_LOGI(TAG, "laser engine started");
+
+#if !RENDER_DEMO
+    // -- Scene streaming: triple-buffered DRAM scene store + TCP receiver. The
+    //    renderer loops the latest published scene. ----------------------------
+    point_stream_init();
+    if (!point_stream_start(SCENE_TCP_PORT)) {
+        ESP_LOGE(TAG, "point_stream_start failed");  // non-fatal: renderer idles
+    }
+#endif
 
     // Renderer on core 1; the gptimer consumer ISR runs on core 0 (where it was
     // installed), so the two don't contend for the same CPU.
