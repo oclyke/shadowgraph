@@ -17,10 +17,10 @@
 //!   # broadcast (default host) and keep sending at 40 Hz
 //!   artnetctl --watch --intensity 0.6
 
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, UdpSocket};
 use std::process::ExitCode;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 
@@ -39,7 +39,8 @@ enum Mode {
 #[command(name = "artnetctl", version,
           about = "Drive the shadowgraph laser over Art-Net (mode toggle + Lissajous settings).")]
 struct Args {
-    /// Device address ("ip" or "ip:port"); defaults to the Art-Net broadcast address.
+    /// Device address: "ip", "ip:port", "name.local" (mDNS), or "auto" to find it
+    /// via ArtPoll discovery. Defaults to the Art-Net broadcast address.
     #[arg(long, default_value = "255.255.255.255")]
     host: String,
     /// Art-Net universe (15-bit Net:SubUni port address) to send on.
@@ -86,6 +87,17 @@ struct Args {
     /// Print the DMX channels and the packet bytes without sending.
     #[arg(long)]
     dry_run: bool,
+
+    /// Discover Art-Net nodes via ArtPoll, print them, and exit (sends no DMX).
+    #[arg(long)]
+    discover: bool,
+    /// Substring a node's name must contain to be picked by --host auto /
+    /// --discover (case-insensitive).
+    #[arg(long, default_value = "shadowgraph")]
+    match_name: String,
+    /// How long to listen for ArtPollReply during discovery, in milliseconds.
+    #[arg(long, default_value_t = 1500)]
+    discover_ms: u64,
 }
 
 /// Quantize a 0..1 fraction to an 8-bit DMX value (rounded, clamped).
@@ -161,12 +173,120 @@ fn target_addr(host: &str) -> String {
     }
 }
 
+/// A node learned from an ArtPollReply.
+struct Node {
+    ip: Ipv4Addr,
+    short: String,
+    long: String,
+}
+
+/// Build an ArtPoll discovery query: header + OpPoll + protocol version.
+fn build_artpoll() -> Vec<u8> {
+    let mut p = b"Art-Net\0".to_vec();
+    p.extend_from_slice(&[0x00, 0x20]); // OpCode 0x2000 = OpPoll (little-endian)
+    p.extend_from_slice(&[0x00, 0x0e]); // ProtVer 14 (big-endian)
+    p.push(0x00); // TalkToMe
+    p.push(0x00); // Priority
+    p
+}
+
+/// Read a null-terminated name field out of an ArtPollReply.
+fn read_cstr(b: &[u8]) -> String {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..end]).into_owned()
+}
+
+/// Parse an ArtPollReply into the node it describes (IP at offset 10, ShortName
+/// at 26, LongName at 44 — see components/artnet_control).
+fn parse_pollreply(pkt: &[u8]) -> Option<Node> {
+    if pkt.len() < 108 || &pkt[0..8] != b"Art-Net\0" {
+        return None;
+    }
+    if u16::from_le_bytes([pkt[8], pkt[9]]) != 0x2100 {
+        return None;
+    }
+    Some(Node {
+        ip: Ipv4Addr::new(pkt[10], pkt[11], pkt[12], pkt[13]),
+        short: read_cstr(&pkt[26..44]),
+        long: read_cstr(&pkt[44..108]),
+    })
+}
+
+/// Broadcast an ArtPoll and collect the unique nodes that reply within `timeout`.
+fn discover(timeout: Duration) -> std::io::Result<Vec<Node>> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.set_broadcast(true)?;
+    sock.set_read_timeout(Some(Duration::from_millis(250)))?;
+    sock.send_to(&build_artpoll(), ("255.255.255.255", ARTNET_PORT))?;
+
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut buf = [0u8; 1024];
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match sock.recv_from(&mut buf) {
+            Ok((n, _src)) => {
+                if let Some(node) = parse_pollreply(&buf[..n]) {
+                    if !nodes.iter().any(|x| x.ip == node.ip) {
+                        nodes.push(node);
+                    }
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(nodes)
+}
+
+/// Discover and pick the node whose name contains `want` (case-insensitive), or
+/// the sole node if there's exactly one. Returns its "ip:port".
+fn resolve_auto(want: &str, timeout: Duration) -> Result<String, String> {
+    let nodes = discover(timeout).map_err(|e| format!("discovery failed: {e}"))?;
+    if nodes.is_empty() {
+        return Err("no Art-Net nodes replied to ArtPoll".into());
+    }
+    let want_lc = want.to_lowercase();
+    let chosen = nodes
+        .iter()
+        .find(|n| n.short.to_lowercase().contains(&want_lc) || n.long.to_lowercase().contains(&want_lc))
+        .or(if nodes.len() == 1 { nodes.first() } else { None });
+    match chosen {
+        Some(n) => {
+            println!("discovered \"{}\" at {}", n.short, n.ip);
+            Ok(format!("{}:{}", n.ip, ARTNET_PORT))
+        }
+        None => Err(format!(
+            "{} nodes replied but none match \"{want}\"; pass --host <ip>",
+            nodes.len()
+        )),
+    }
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
 
+    // Discovery-only mode: broadcast an ArtPoll, list who answers, and exit.
+    if args.discover {
+        match discover(Duration::from_millis(args.discover_ms)) {
+            Ok(nodes) if nodes.is_empty() => println!("no Art-Net nodes replied to ArtPoll"),
+            Ok(nodes) => {
+                println!("discovered {} node(s):", nodes.len());
+                for n in &nodes {
+                    println!("  {:<15} {}  ({})", n.ip.to_string(), n.short, n.long);
+                }
+            }
+            Err(e) => {
+                eprintln!("discovery failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let ch = channels(&args);
     let dmx = dmx_frame(args.base, &ch);
-    let target = target_addr(&args.host);
 
     println!(
         "fixture @ universe {} base ch {}: mode={:?} fx={} fy={} size={:.2} \
@@ -185,6 +305,19 @@ fn main() -> ExitCode {
                  pkt.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
         return ExitCode::SUCCESS;
     }
+
+    // Resolve the target: discover it via ArtPoll when --host auto.
+    let target = if args.host == "auto" {
+        match resolve_auto(&args.match_name, Duration::from_millis(args.discover_ms)) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        target_addr(&args.host)
+    };
 
     let sock = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -267,5 +400,34 @@ mod tests {
         assert_eq!(pkt[14], 0x13); // SubUni
         assert_eq!(pkt[15], 0x02); // Net
         assert_eq!(&pkt[16..18], &[0x00, 0x02]); // length 2 BE
+    }
+
+    #[test]
+    fn artpoll_is_wellformed() {
+        let p = build_artpoll();
+        assert_eq!(&p[0..8], b"Art-Net\0");
+        assert_eq!(&p[8..10], &[0x00, 0x20]); // OpPoll LE
+        assert_eq!(&p[10..12], &[0x00, 0x0e]); // ProtVer 14 BE
+    }
+
+    #[test]
+    fn pollreply_parses_ip_and_names() {
+        // Hand-build the fields the firmware fills (see artnet_pollreply_build).
+        let mut pkt = vec![0u8; 239];
+        pkt[0..8].copy_from_slice(b"Art-Net\0");
+        pkt[8] = 0x00;
+        pkt[9] = 0x21; // OpPollReply, little-endian
+        pkt[10..14].copy_from_slice(&[192, 168, 1, 50]);
+        pkt[26..26 + 11].copy_from_slice(b"shadowgraph");
+        pkt[44..44 + 27].copy_from_slice(b"shadowgraph laser projector");
+
+        let node = parse_pollreply(&pkt).expect("valid reply should parse");
+        assert_eq!(node.ip, Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(node.short, "shadowgraph");
+        assert_eq!(node.long, "shadowgraph laser projector");
+
+        // Wrong opcode (an ArtPoll, say) is not a reply.
+        pkt[9] = 0x20;
+        assert!(parse_pollreply(&pkt).is_none());
     }
 }

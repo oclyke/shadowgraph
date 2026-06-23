@@ -171,4 +171,59 @@ TEST(ArtnetDefaults, AreAPatternLissajous)
     EXPECT_GT(st.intensity, 0.0f);
 }
 
+// Build a minimal ArtPoll (discovery query): header + OpPoll + ProtVer + flags.
+std::vector<uint8_t> make_artpoll()
+{
+    std::vector<uint8_t> p = {'A','r','t','-','N','e','t','\0'};
+    p.push_back(0x00); p.push_back(0x20);   // OpPoll, little-endian
+    p.push_back(0x00); p.push_back(0x0e);   // ProtVer 14
+    p.push_back(0x00);                      // TalkToMe
+    p.push_back(0x00);                      // Priority
+    return p;
+}
+
+TEST(ArtnetPoll, DetectsPollAndRejectsOthers)
+{
+    auto poll = make_artpoll();
+    EXPECT_TRUE(artnet_is_poll(poll.data(), poll.size()));
+
+    // An ArtDmx is Art-Net but not a poll.
+    auto dmx = make_artdmx(1, std::vector<uint8_t>(8, 0));
+    EXPECT_FALSE(artnet_is_poll(dmx.data(), dmx.size()));
+
+    // Wrong magic / too short.
+    poll[0] = 'X';
+    EXPECT_FALSE(artnet_is_poll(poll.data(), poll.size()));
+    EXPECT_FALSE(artnet_is_poll(poll.data(), 4));
+}
+
+TEST(ArtnetPollReply, IsWellFormed)
+{
+    const uint8_t ip[4] = {192, 168, 1, 50};
+    uint8_t out[ARTNET_POLLREPLY_SIZE];
+    size_t n = artnet_pollreply_build(out, sizeof(out), ip, /*universe=*/0x0123,
+                                      "shadowgraph", "shadowgraph laser projector");
+    ASSERT_EQ(n, (size_t)ARTNET_POLLREPLY_SIZE);
+
+    EXPECT_EQ(0, memcmp(out, "Art-Net\0", 8));
+    EXPECT_EQ(out[8], 0x00);                 // OpPollReply low byte
+    EXPECT_EQ(out[9], 0x21);                 // OpPollReply high byte
+    EXPECT_EQ(0, memcmp(out + 10, ip, 4));   // node IP
+    EXPECT_EQ(out[14], 0x36);                // port 6454, little-endian
+    EXPECT_EQ(out[15], 0x19);
+    EXPECT_STREQ((const char *)(out + 26), "shadowgraph");          // ShortName
+    EXPECT_STREQ((const char *)(out + 44), "shadowgraph laser projector"); // LongName
+    // Universe split across NetSwitch / SubSwitch / SwOut.
+    EXPECT_EQ(out[18], (0x0123 >> 8) & 0x7f);
+    EXPECT_EQ(out[19], (0x0123 >> 4) & 0x0f);
+    EXPECT_EQ(out[190], 0x0123 & 0x0f);
+}
+
+TEST(ArtnetPollReply, RejectsTooSmallBuffer)
+{
+    uint8_t out[ARTNET_POLLREPLY_SIZE - 1];
+    const uint8_t ip[4] = {10, 0, 0, 1};
+    EXPECT_EQ(artnet_pollreply_build(out, sizeof(out), ip, 1, "x", "y"), (size_t)0);
+}
+
 }  // namespace

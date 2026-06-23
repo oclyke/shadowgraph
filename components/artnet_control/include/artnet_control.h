@@ -74,6 +74,27 @@ bool artnet_parse(const uint8_t *pkt, size_t len,
 void artnet_control_decode(const uint8_t *dmx, uint16_t len,
                            uint16_t base_channel, artnet_control_state_t *out);
 
+// --- Discovery (ArtPoll / ArtPollReply) ------------------------------------
+// A controller broadcasts an ArtPoll; every node answers with an ArtPollReply
+// carrying its IP + name, so the controller learns where to send. The device
+// answers ArtPolls on its existing :6454 socket (no multicast). See the matching
+// query/reply helpers in tools/artnetctl.
+
+// An ArtPollReply is a fixed-size packet.
+#define ARTNET_POLLREPLY_SIZE 239
+
+// True if `pkt` is a valid Art-Net ArtPoll (the discovery query, OpCode 0x2000).
+bool artnet_is_poll(const uint8_t *pkt, size_t len);
+
+// Build an ArtPollReply describing this node into `out` (needs cap >=
+// ARTNET_POLLREPLY_SIZE). `ip` is the node's IPv4 as four octets a.b.c.d;
+// `universe` is the 15-bit port address it listens on; `short_name` (<= 17 chars
+// shown) and `long_name` (<= 63) are copied into the name fields a controller
+// displays. Returns bytes written, or 0 if `cap` is too small.
+size_t artnet_pollreply_build(uint8_t *out, size_t cap, const uint8_t ip[4],
+                              uint16_t universe, const char *short_name,
+                              const char *long_name);
+
 // Fill `out` with the offline defaults: pattern mode, a 3:2 Lissajous at ~20%
 // size, hue 0, 25% intensity, a gentle morph. Used until the first DMX frame
 // arrives (and as the no-network fallback).

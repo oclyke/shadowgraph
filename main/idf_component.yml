@@ -1,0 +1,5 @@
+## Managed component dependencies for the app (fetched from the ESP component
+## registry on first build). mDNS lets hosts reach the device by name
+## (shadowgraph.local) instead of its DHCP IP.
+dependencies:
+  espressif/mdns: "^1.2"

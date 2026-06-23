@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "mdns.h"
 
 #include "dac8871_idf6.h"
 #include "dacx0004_idf6.h"
@@ -245,6 +246,28 @@ static void render_task(void *arg)
     }
 }
 
+#if ENABLE_NET
+// Advertise the device over mDNS so hosts can use a stable name instead of the
+// DHCP IP: ildaplay/artnetctl --host shadowgraph.local. Also publishes the
+// Art-Net and scene-stream services for discovery-aware tools. Non-fatal: on
+// failure the device still works, you just address it by IP.
+#define MDNS_HOSTNAME "shadowgraph"
+static void start_mdns(void)
+{
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_init failed: %s (address the device by IP)",
+                 esp_err_to_name(err));
+        return;
+    }
+    mdns_hostname_set(MDNS_HOSTNAME);
+    mdns_instance_name_set("shadowgraph laser projector");
+    mdns_service_add(NULL, "_artnet", "_udp", 6454, NULL, 0);
+    mdns_service_add(NULL, "_shadowgraph", "_tcp", SCENE_TCP_PORT, NULL, 0);
+    ESP_LOGI(TAG, "mDNS up: %s.local", MDNS_HOSTNAME);
+}
+#endif
+
 // Low-priority watchdog on producer health: log the engine's underrun count
 // once a second. A rising delta means render_task can't keep the ring full at
 // POINT_RATE_HZ and the beam is being blanked on empty ticks (visible flicker).
@@ -362,6 +385,8 @@ void app_main(void)
     if (!artnet_control_start()) {
         ESP_LOGE(TAG, "artnet_control_start failed");  // non-fatal: defaults hold
     }
+    // mDNS: reach the device as shadowgraph.local instead of by DHCP IP.
+    start_mdns();
 #endif
 
     // Renderer on core 1; the gptimer consumer ISR runs on core 0 (where it was

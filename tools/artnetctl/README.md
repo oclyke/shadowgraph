@@ -9,6 +9,25 @@ channels to its control state (see [`components/artnet_control`](../../component
 It **holds** the last values it received, so a single invocation is enough — by
 default `artnetctl` sends a short burst (UDP is lossy) and exits.
 
+## Finding the device
+
+You don't have to know the IP. Three options:
+
+```sh
+# 1. list everything that answers an Art-Net ArtPoll
+cargo run --manifest-path tools/artnetctl/Cargo.toml -- --discover
+
+# 2. let the tool discover + target the shadowgraph node automatically
+cargo run --manifest-path tools/artnetctl/Cargo.toml -- --host auto --mode stream
+
+# 3. mDNS: the device advertises shadowgraph.local (works as --host for ildaplay too)
+cargo run --manifest-path tools/artnetctl/Cargo.toml -- --host shadowgraph.local --mode stream
+```
+
+`--discover` broadcasts an ArtPoll and prints each node's IP + name; `--host auto`
+does the same and picks the node whose name matches `--match-name` (default
+`shadowgraph`), or the only node if there's just one.
+
 ## Usage
 
 ```sh
@@ -31,7 +50,10 @@ cargo run --manifest-path tools/artnetctl/Cargo.toml -- --mode stream --dry-run
 
 | flag | meaning | default |
 |------|---------|---------|
-| `--host` | device address (`ip` or `ip:port`); the default is the Art-Net broadcast address | `255.255.255.255` |
+| `--host` | device address: `ip`, `ip:port`, `name.local` (mDNS), or `auto` (ArtPoll discovery); default is the Art-Net broadcast address | `255.255.255.255` |
+| `--discover` | broadcast an ArtPoll, print the nodes that answer, and exit | off |
+| `--match-name` | substring a node's name must contain for `--host auto` / `--discover` | `shadowgraph` |
+| `--discover-ms` | how long to listen for ArtPollReply | `1500` |
 | `--universe` | Art-Net universe (15-bit Net:SubUni port address) | `1` |
 | `--base` | 1-based DMX channel of the fixture's first slot | `1` |
 | `--mode` | `pattern` (Lissajous) or `stream` (looped scene) | `pattern` |

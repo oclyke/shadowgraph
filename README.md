@@ -134,6 +134,8 @@ idf.py fullclean
   mode (built-in Lissajous **pattern** vs the streamed **scene**), the rest tune
   the pattern's frequency, size, hue, intensity, and morph. Drive it from a
   console, from QLC+/Resolume, or from the [`artnetctl`](tools/artnetctl) CLI.
+  Also answers Art-Net **ArtPoll** for discovery, so it shows up in any Art-Net
+  controller's node list (and in `artnetctl --discover`).
 
 ## Control (pattern vs. stream)
 
@@ -141,17 +143,23 @@ The projector starts on its built-in Lissajous and switches to the streamed
 scene on command — both selected at runtime over Art-Net, no reflash:
 
 ```sh
+# don't know the IP? discover it (or use --host auto / shadowgraph.local)
+cargo run --manifest-path tools/artnetctl/Cargo.toml -- --discover
+
 # point at the streamed scene, then push frames
-cargo run --manifest-path tools/artnetctl/Cargo.toml -- --host <device-ip> --mode stream
+cargo run --manifest-path tools/artnetctl/Cargo.toml -- --host auto --mode stream
 ./play.sh --once tools/svg2scene/examples/chicken.svg
 
 # back to a live pattern (5:4 Lissajous, half size, slow morph)
 cargo run --manifest-path tools/artnetctl/Cargo.toml -- \
-    --host <device-ip> --mode pattern --fx 5 --fy 4 --size 0.5 --morph 0.2
+    --host shadowgraph.local --mode pattern --fx 5 --fy 4 --size 0.5 --morph 0.2
 ```
 
-See [`tools/artnetctl`](tools/artnetctl) for the full option list and the DMX
-channel map.
+The device is reachable three ways without hunting for its DHCP address:
+`artnetctl --discover` / `--host auto` (Art-Net **ArtPoll**), or `shadowgraph.local`
+(**mDNS** — also works as `--host` for `ildaplay`). See
+[`tools/artnetctl`](tools/artnetctl) for the full option list and the DMX channel
+map.
 
 ## Host unit tests
 
