@@ -1,120 +1,136 @@
-//! Encode the planned move list into the firmware TV wire format.
-//!
-//! Every move is a `CURVE` (P0 implicit = previous P3, so the first move starts
-//! at the engine's centre). A `LASER` precedes a move only when the colour
-//! changes; a blank travel move is colour 0. Bytes match `laser_command`:
-//!   LASER 0x02 : r,g,b u16            (7 bytes)
-//!   CURVE 0x04 : P1,P2,P3 u16 ; v_in,v_out u32   (21 bytes), little-endian.
-//! v_in/v_out are tick-native (counts/tick * 256); the planner's counts/s cross to
-//! that format here via `cps_to_wire` — the one host-side physical->tick step.
+//! Serialise the interpolated point stream to a standard **ILDA** file (Image
+//! Data Transfer Format, format 5 — 2D true colour, big-endian). This is the
+//! tool's native output and its wire format: the device parses ILDA directly, so
+//! the same bytes that get written to a `.ild` are what `--stream` sends. The
+//! ILDA status bits (0x80 last / 0x40 blank) are identical to the firmware's.
 
-use kurbo::Point;
-
-use crate::interp::{cps_to_wire, CurveLimits};
-use crate::model::Move;
+use crate::model::{IldaPoint, POINT_BLANK, POINT_LAST};
+use crate::optimize::OutPoint;
 
 pub struct EmitOptions {
+    /// Counts from field centre to edge for `pos = ±1`. Stay within the galvo
+    /// linear region (see `main/main.c` `GALVO_AMPLITUDE`).
+    pub amplitude: f64,
+    /// Brightness scale applied to all colours (0..1).
     pub intensity: f32,
 }
 
-fn u16c(v: f64) -> u16 {
-    v.round().clamp(0.0, 65535.0) as u16
+fn to_i16(v_norm: f32, amp: f64) -> i16 {
+    (v_norm as f64 * amp)
+        .round()
+        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
 }
 
-fn col(rgb: [f32; 3], intensity: f32) -> [u16; 3] {
-    let s = |c: f32| ((c * intensity).clamp(0.0, 1.0) * 65535.0).round() as u16;
-    [s(rgb[0]), s(rgb[1]), s(rgb[2])]
+fn chan(c: f32, intensity: f32) -> u8 {
+    ((c * intensity).clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-fn put16(o: &mut Vec<u8>, v: u16) {
-    o.extend_from_slice(&v.to_le_bytes());
-}
-fn put32(o: &mut Vec<u8>, v: u32) {
-    o.extend_from_slice(&v.to_le_bytes());
-}
-fn putp(o: &mut Vec<u8>, p: Point) {
-    put16(o, u16c(p.x));
-    put16(o, u16c(p.y));
-}
-
-/// Encode the whole scene to wire bytes. `lim` supplies the tick duration used to
-/// convert the planner's counts/s speeds into the wire's counts/tick format.
-pub fn encode_scene(moves: &[Move], lim: &CurveLimits, opts: &EmitOptions) -> Vec<u8> {
-    let dt = lim.dt_tick_us;
-    let mut out = Vec::new();
-    let mut cur_color: Option<[u16; 3]> = None;
-    for m in moves {
-        let color = if m.blank {
-            [0u16; 3]
-        } else {
-            col(m.color, opts.intensity)
-        };
-        if cur_color != Some(color) {
-            out.push(0x02); // LASER
-            put16(&mut out, color[0]);
-            put16(&mut out, color[1]);
-            put16(&mut out, color[2]);
-            cur_color = Some(color);
-        }
-        out.push(0x04); // CURVE (P0 implicit)
-        putp(&mut out, m.cubic.p1);
-        putp(&mut out, m.cubic.p2);
-        putp(&mut out, m.cubic.p3);
-        put32(&mut out, cps_to_wire(m.v_in, dt));
-        put32(&mut out, cps_to_wire(m.v_out, dt));
+/// Map the normalised, interpolated `OutPoint`s to ILDA points in DAC space, and
+/// bracket the loop with a blanked point at the start position so the wrap-around
+/// seam (device loops the buffer) draws no retrace line.
+pub fn build_scene(out: &[OutPoint], opts: &EmitOptions) -> Vec<IldaPoint> {
+    if out.is_empty() {
+        return Vec::new();
     }
-    out
+    let blank_at = |p: [f32; 2]| IldaPoint {
+        x: to_i16(p[0], opts.amplitude),
+        y: to_i16(p[1], opts.amplitude),
+        blank: true,
+        r: 0,
+        g: 0,
+        b: 0,
+    };
+
+    let first = out[0].pos;
+    let mut scene = Vec::with_capacity(out.len() + 2);
+    scene.push(blank_at(first)); // open blanked at the start
+    for p in out {
+        let blank = p.is_blank();
+        scene.push(IldaPoint {
+            x: to_i16(p.pos[0], opts.amplitude),
+            y: to_i16(p.pos[1], opts.amplitude),
+            blank,
+            r: chan(p.rgb[0], opts.intensity),
+            g: chan(p.rgb[1], opts.intensity),
+            b: chan(p.rgb[2], opts.intensity),
+        });
+    }
+    scene.push(blank_at(first)); // close blanked back to the start
+    scene
 }
 
-/// Number of CURVE records (for reporting).
-pub fn curve_count(moves: &[Move]) -> usize {
-    moves.len()
+fn status(p: &IldaPoint, last: bool) -> u8 {
+    let mut s = 0u8;
+    if p.blank {
+        s |= POINT_BLANK;
+    }
+    if last {
+        s |= POINT_LAST;
+    }
+    s
+}
+
+/// Standard ILDA file, format 5 (2D true colour), big-endian. One section plus a
+/// zero-record terminating header.
+pub fn encode_ild(scene: &[IldaPoint], frame_name: &str) -> Vec<u8> {
+    fn header(out: &mut Vec<u8>, format: u8, name: &str, records: u16) {
+        out.extend_from_slice(b"ILDA");
+        out.extend_from_slice(&[0, 0, 0]); // reserved
+        out.push(format);
+        let mut pad8 = |s: &str| {
+            let mut b = [b' '; 8];
+            for (i, c) in s.bytes().take(8).enumerate() {
+                b[i] = c;
+            }
+            out.extend_from_slice(&b);
+        };
+        pad8(name); // frame name
+        pad8("shadowgr"); // company name
+        out.extend_from_slice(&records.to_be_bytes()); // number of records
+        out.extend_from_slice(&0u16.to_be_bytes()); // frame number
+        out.extend_from_slice(&1u16.to_be_bytes()); // total frames
+        out.push(0); // projector number
+        out.push(0); // reserved
+    }
+
+    let n = u16::try_from(scene.len()).unwrap_or(u16::MAX);
+    let mut out = Vec::new();
+    header(&mut out, 5, frame_name, n);
+    for (i, p) in scene.iter().take(n as usize).enumerate() {
+        out.extend_from_slice(&p.x.to_be_bytes());
+        out.extend_from_slice(&p.y.to_be_bytes());
+        out.push(status(p, i + 1 == n as usize));
+        out.push(p.b); // ILDA true-colour order is B, G, R
+        out.push(p.g);
+        out.push(p.r);
+    }
+    header(&mut out, 5, frame_name, 0); // terminating header
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kurbo::{CubicBez, Point};
+
+    fn lit(x: i16, y: i16, r: u8, g: u8, b: u8) -> IldaPoint {
+        IldaPoint { x, y, blank: false, r, g, b }
+    }
 
     #[test]
-    fn curve_wire_layout() {
-        let m = Move {
-            cubic: CubicBez::new(
-                Point::new(0.0, 0.0),
-                Point::new(100.0, 200.0),
-                Point::new(300.0, 400.0),
-                Point::new(500.0, 600.0),
-            ),
-            color: [1.0, 0.0, 0.0],
-            blank: false,
-            v_in: 1000.0,
-            v_out: 2000.0,
-        };
-        let lim = CurveLimits {
-            v_max_cps: 11_468_800,
-            a_max_cps2: 57_344_000_000,
-            dt_tick_us: 50,
-        };
-        let b = encode_scene(&[m], &lim, &EmitOptions { intensity: 1.0 });
-        // LASER (colour changed from none): 0x02 + r,g,b u16 = 7 bytes, then CURVE.
-        assert_eq!(b[0], 0x02);
-        assert_eq!(u16::from_le_bytes([b[1], b[2]]), 0xFFFF); // red full
-        assert_eq!(u16::from_le_bytes([b[3], b[4]]), 0);
-        let c = 7;
-        assert_eq!(b[c], 0x04); // CURVE
-        assert_eq!(u16::from_le_bytes([b[c + 1], b[c + 2]]), 100); // P1.x
-        assert_eq!(u16::from_le_bytes([b[c + 3], b[c + 4]]), 200); // P1.y
-        assert_eq!(u16::from_le_bytes([b[c + 9], b[c + 10]]), 500); // P3.x
-        assert_eq!(u16::from_le_bytes([b[c + 11], b[c + 12]]), 600); // P3.y
-        // Speeds are encoded in wire units (counts/tick * 256), not raw counts/s.
-        assert_eq!(
-            u32::from_le_bytes([b[c + 13], b[c + 14], b[c + 15], b[c + 16]]),
-            cps_to_wire(1000.0, lim.dt_tick_us)
-        );
-        assert_eq!(
-            u32::from_le_bytes([b[c + 17], b[c + 18], b[c + 19], b[c + 20]]),
-            cps_to_wire(2000.0, lim.dt_tick_us)
-        );
-        assert_eq!(b.len(), 7 + 21); // P0 implicit
+    fn ild_header_and_record() {
+        let scene = vec![lit(0x0102, -2, 0xAA, 0xBB, 0xCC)];
+        let f = encode_ild(&scene, "test");
+        assert_eq!(&f[0..4], b"ILDA");
+        assert_eq!(f[7], 5); // format 5
+        assert_eq!(&f[24..26], &1u16.to_be_bytes()); // record count BE
+        let rec = 32; // first record starts after the 32-byte header
+        assert_eq!(&f[rec..rec + 2], &0x0102i16.to_be_bytes()); // X BE
+        assert_eq!(&f[rec + 2..rec + 4], &(-2i16).to_be_bytes()); // Y BE
+        assert_eq!(f[rec + 4], POINT_LAST);
+        assert_eq!([f[rec + 5], f[rec + 6], f[rec + 7]], [0xCC, 0xBB, 0xAA]); // B,G,R
+        // terminating header with 0 records at the end.
+        let end = f.len() - 32;
+        assert_eq!(&f[end..end + 4], b"ILDA");
+        assert_eq!(&f[end + 24..end + 26], &0u16.to_be_bytes());
     }
 }

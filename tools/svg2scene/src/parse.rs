@@ -1,12 +1,13 @@
-//! SVG -> coloured cubic-Bézier subpaths.
+//! SVG → coloured polylines, normalised to `[-1,1]`.
 //!
-//! Parses with `usvg` (resolves units/styles/transforms), keeps the geometry as
-//! **cubics** (no flattening — that is the whole point of the curve pipeline),
-//! then fits everything into DAC-count space (`[-1,1]` field -> counts, y-up).
+//! `usvg` resolves units/styles/transforms and yields absolute path geometry;
+//! `kurbo` flattens every Bézier to line segments (the only "curve handling" we
+//! want — pure geometry, no dynamics). Everything is then fitted into the
+//! normalised `[-1,1]` field `lasy` reasons about (y-up; SVG is y-down).
 
-use kurbo::{BezPath, CubicBez, PathEl, Point, QuadBez, Rect, Shape};
+use kurbo::{BezPath, PathEl, Point, Rect, Shape};
 
-use crate::model::{Rgb, Subpath, GALVO_CENTER};
+use crate::model::{Polyline, Rgb};
 
 pub struct ParseOptions {
     pub default_color: Rgb,
@@ -66,9 +67,7 @@ fn collect(node: &usvg::Node, out: &mut Vec<RawPath>, default: Rgb) {
                     S::MoveTo(a) => bez.move_to(map(a.x, a.y)),
                     S::LineTo(a) => bez.line_to(map(a.x, a.y)),
                     S::QuadTo(a, b) => bez.quad_to(map(a.x, a.y), map(b.x, b.y)),
-                    S::CubicTo(a, b, c) => {
-                        bez.curve_to(map(a.x, a.y), map(b.x, b.y), map(c.x, c.y))
-                    }
+                    S::CubicTo(a, b, c) => bez.curve_to(map(a.x, a.y), map(b.x, b.y), map(c.x, c.y)),
                     S::Close => bez.close_path(),
                 }
             }
@@ -93,14 +92,12 @@ pub fn parse_svg(data: &[u8], opts: &ParseOptions) -> Result<Vec<RawPath>, Strin
     Ok(out)
 }
 
-fn line_cubic(a: Point, b: Point) -> CubicBez {
-    CubicBez::new(a, a.lerp(b, 1.0 / 3.0), a.lerp(b, 2.0 / 3.0), b)
-}
-
-/// Fit all paths into count space: uniform scale so the larger bbox dimension
-/// fills the field (minus `margin`), centred at 0x8000, y flipped (SVG is y-down,
-/// the field is y-up). `amplitude` = counts from centre to field edge (±1).
-pub fn fit_to_counts(paths: &[RawPath], amplitude: f64, margin: f64) -> Vec<Subpath> {
+/// Flatten every path to polylines and fit into the normalised `[-1,1]` field:
+/// uniform scale so the larger bbox dimension fills the field (minus `margin`),
+/// centred at 0, y flipped (SVG y-down → field y-up). `flatten_tol` is given in
+/// **normalised units** (fraction of the half-field) and converted to SVG units
+/// internally, so it means the same thing regardless of the source SVG's scale.
+pub fn flatten_and_fit(paths: &[RawPath], flatten_tol: f64, margin: f64) -> Vec<Polyline> {
     let mut bbox: Option<Rect> = None;
     for p in paths {
         let bb = p.bez.bounding_box();
@@ -111,66 +108,53 @@ pub fn fit_to_counts(paths: &[RawPath], amplitude: f64, margin: f64) -> Vec<Subp
     }
     let Some(bb) = bbox else { return Vec::new() };
 
-    let half = (amplitude * (1.0 - margin)).max(1.0);
-    let span = (bb.width().max(bb.height())).max(1e-9);
-    let s = (2.0 * half) / span; // scale: larger dim -> full field width
+    let span = bb.width().max(bb.height()).max(1e-9);
+    let scale = (1.0 - margin) * 2.0 / span; // larger dim → full field width (2.0)
     let (cx, cy) = (bb.center().x, bb.center().y);
-    let map = |p: Point| -> Point {
-        Point::new(
-            GALVO_CENTER + (p.x - cx) * s,
-            GALVO_CENTER - (p.y - cy) * s, // y-up
-        )
+    let map = |p: Point| -> [f32; 2] {
+        [
+            ((p.x - cx) * scale) as f32,
+            (-(p.y - cy) * scale) as f32, // y-up
+        ]
     };
+    // flatten_tol is normalised (field half-width = 1.0); convert back to SVG units.
+    let tol_svg = (flatten_tol * span / 2.0).max(1e-9);
 
-    let mut subpaths = Vec::new();
+    let mut out = Vec::new();
     for path in paths {
-        let mut cur = Point::ZERO;
-        let mut start = Point::ZERO;
-        let mut cubics: Vec<CubicBez> = Vec::new();
-        let mut closed = false;
-        let mut flush = |cubics: &mut Vec<CubicBez>, closed: &mut bool| {
-            if !cubics.is_empty() {
-                subpaths.push(Subpath {
+        // Flatten to a flat list of MoveTo/LineTo/ClosePath elements first, then
+        // split into polylines on MoveTo (avoids borrow tangles in the callback).
+        let mut els: Vec<PathEl> = Vec::new();
+        kurbo::flatten(path.bez.iter(), tol_svg, |el| els.push(el));
+
+        let mut run: Vec<[f32; 2]> = Vec::new();
+        let flush = |run: &mut Vec<[f32; 2]>, out: &mut Vec<Polyline>| {
+            if run.len() >= 2 {
+                out.push(Polyline {
                     color: path.color,
-                    closed: *closed,
-                    cubics: std::mem::take(cubics),
+                    pts: std::mem::take(run),
                 });
+            } else {
+                run.clear();
             }
-            *closed = false;
         };
-        for el in path.bez.elements() {
+        for el in els {
             match el {
                 PathEl::MoveTo(p) => {
-                    flush(&mut cubics, &mut closed);
-                    cur = map(*p);
-                    start = cur;
+                    flush(&mut run, &mut out);
+                    run.push(map(p));
                 }
-                PathEl::LineTo(p) => {
-                    let q = map(*p);
-                    cubics.push(line_cubic(cur, q));
-                    cur = q;
-                }
-                PathEl::QuadTo(c, p) => {
-                    let (c, p) = (map(*c), map(*p));
-                    cubics.push(QuadBez::new(cur, c, p).raise());
-                    cur = p;
-                }
-                PathEl::CurveTo(c1, c2, p) => {
-                    let (c1, c2, p) = (map(*c1), map(*c2), map(*p));
-                    cubics.push(CubicBez::new(cur, c1, c2, p));
-                    cur = p;
-                }
+                PathEl::LineTo(p) => run.push(map(p)),
                 PathEl::ClosePath => {
-                    if (cur - start).hypot() > 1e-6 {
-                        cubics.push(line_cubic(cur, start));
+                    if let Some(&first) = run.first() {
+                        run.push(first); // close the loop with a final segment
                     }
-                    cur = start;
-                    closed = true;
-                    flush(&mut cubics, &mut closed);
+                    flush(&mut run, &mut out);
                 }
+                _ => {}
             }
         }
-        flush(&mut cubics, &mut closed);
+        flush(&mut run, &mut out);
     }
-    subpaths
+    out
 }

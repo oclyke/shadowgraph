@@ -1,5 +1,10 @@
 CONFIG_IDF_TARGET="esp32"
 
+# Run the core at the full 240 MHz. The renderer produces points at POINT_RATE_HZ
+# from a flash-resident loop; 160 MHz left it flash-stall bound and underrunning
+# the point ring. The board is mains-powered, so there is no reason to clock down.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
 # Laser engine: the gptimer alarm callback is the SPI consumer and must keep
 # running even while the flash cache is disabled (e.g. during a flash write), so
 # the whole ISR path lives in IRAM and touches no flash.

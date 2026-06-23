@@ -1,34 +1,30 @@
-//! CLI driver: SVG -> parse -> fit -> order -> segment -> plan -> emit, writing
-//! the CURVE wire bytes and (optionally) a Bazel-style debug bundle whose stages
-//! are each visualised. Simulation is bit-exact via FFI to `curve_interp`.
+//! CLI driver: SVG → parse → flatten/fit → optimize (lasy) → emit one **ILDA
+//! frame** (`.ild`, format 5), plus an optional Bazel-style debug bundle whose
+//! stages are each visualised. Playout/streaming is a separate tool (`ildaplay`).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
 
-use svg2scene::analyze;
 use svg2scene::emit::{self, EmitOptions};
-use svg2scene::interp::CurveLimits;
-use svg2scene::order;
+use svg2scene::optimize::{self, OptimizeOptions};
 use svg2scene::parse::{self, ParseOptions};
-use svg2scene::plan;
-use svg2scene::segment;
 use svg2scene::viz;
 
-/// Convert an SVG into a cubic-Bézier (CURVE) galvo laser command stream.
+/// Convert an SVG into a single ILDA frame (.ild, format 5).
 #[derive(Parser, Debug)]
 #[command(name = "svg2scene", version)]
 struct Args {
     /// Input SVG file.
     input: PathBuf,
 
-    /// Write the raw .scene wire bytes here.
+    /// Write the ILDA (.ild) frame here.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Emit the debug bundle (parse/order/segment/plan/points/profile + scene)
-    /// and drop a convenience symlink to it here. Bare flag uses `./output`.
+    /// Emit the debug bundle (input/parse/points + scene.ild) and drop a
+    /// convenience symlink to it here. Bare flag uses `./output`.
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "output")]
     debug_output_dir: Option<PathBuf>,
     /// Backing store for the real debug files (per-input subdir). Rarely set;
@@ -39,22 +35,33 @@ struct Args {
     /// Field border fraction left around the drawing (0..1).
     #[arg(long, default_value_t = 0.05)]
     margin: f64,
-    /// DAC counts from field centre to edge (pos = ±1). Must match the limits.
-    #[arg(long, default_value_t = 28672.0)]
+    /// DAC counts from field centre to edge (pos = ±1). Stay in the galvo linear
+    /// region (cf. main/main.c GALVO_AMPLITUDE).
+    #[arg(long, default_value_t = 16000.0)]
     amplitude: f64,
-
-    // The galvo limits (v_max, a_max, interpolation tick) are NOT flags: they are
-    // properties of the device, read from the firmware (curve_interp.h) over FFI
-    // so the plan/simulation always match what the device draws. To change them,
-    // edit curve_interp.h and rebuild firmware + tool.
-    /// Corner rounding (junction deviation) in counts: bigger = faster through
-    /// corners, more rounding. (Host planning choice, not a galvo limit.)
-    #[arg(long, default_value_t = 200.0)]
-    corner_dev: f64,
-
     /// Brightness scale applied to all colours (0..1).
     #[arg(long, default_value_t = 1.0)]
     intensity: f32,
+    /// Bézier flattening tolerance, in normalised units (fraction of half-field).
+    #[arg(long, default_value_t = 0.002)]
+    flatten_tol: f64,
+
+    /// Target total points per frame (density). Implied refresh = point-rate / N.
+    #[arg(long, default_value_t = 600)]
+    points: u32,
+    /// lasy distance-per-point floor (normalised units).
+    #[arg(long, default_value_t = 0.1)]
+    distance_per_point: f32,
+    /// Points held at the end of each blank (light-modulator settle).
+    #[arg(long, default_value_t = 10)]
+    blank_points: u32,
+    /// Radians of corner angle per extra dwell point (galvo inertia at sharp turns).
+    #[arg(long, default_value_t = 0.6)]
+    corner_radians: f32,
+
+    /// Engine point rate (Hz) used only to report the implied refresh.
+    #[arg(long, default_value_t = 30000.0)]
+    point_rate_hz: f64,
 }
 
 fn setup_debug_dir(
@@ -113,7 +120,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let bundle = |name: &str| debug_dir.as_ref().map(|d| d.join(name));
-    let write = |path: Option<PathBuf>, body: &str| -> std::io::Result<()> {
+    let write = |path: Option<PathBuf>, body: &[u8]| -> std::io::Result<()> {
         if let Some(p) = path {
             std::fs::write(&p, body)?;
             eprintln!("wrote {}", p.display());
@@ -121,90 +128,76 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
-    // Limits are the device's, read from the firmware — never set on the host.
-    let lim = CurveLimits::device_default();
-
-    // 0. copy the input verbatim into the bundle, so the source sits alongside
-    // the per-stage views (and the numbering reads start-to-finish).
     if let Some(p) = bundle("0-input.svg") {
-        std::fs::write(&p, &data)?;
-        eprintln!("wrote {}", p.display());
+        write(Some(p), &data)?;
     }
 
-    // 1. parse + fit
+    // 1. parse + flatten + fit
     let raw = parse::parse_svg(&data, &ParseOptions::default())?;
     if raw.is_empty() {
         return Err("no drawable paths in SVG".into());
     }
-    let fitted = parse::fit_to_counts(&raw, args.amplitude, args.margin);
-    if fitted.is_empty() {
-        return Err("nothing to draw after fit".into());
+    let polys = parse::flatten_and_fit(&raw, args.flatten_tol, args.margin);
+    if polys.is_empty() {
+        return Err("nothing to draw after flatten/fit".into());
     }
-    write(bundle("1-parse.svg"), &viz::parse_svg(&fitted))?;
+    write(bundle("1-parse.svg"), viz::parse_svg(&polys).as_bytes())?;
 
-    // 2. order (+ blanking)
-    let ordered = order::order(fitted);
-    write(bundle("2-order.svg"), &viz::order_svg(&order::build_moves(&ordered)))?;
-
-    // 3. segment
-    let segmented: Vec<_> = ordered.iter().map(|s| segment::segment_subpath(s, 0.1)).collect();
-    write(bundle("3-segment.svg"), &viz::segment_svg(&segmented))?;
-
-    // 4. build moves + plan (junction velocities + global look-ahead)
-    let mut moves = order::build_moves(&segmented);
-    if moves.is_empty() {
-        return Err("no moves produced".into());
+    // 2. optimize (lasy euler-circuit + interpolation)
+    let opt = OptimizeOptions {
+        target_points: args.points,
+        distance_per_point: args.distance_per_point,
+        blank_points: args.blank_points,
+        corner_radians: args.corner_radians,
+    };
+    let out = optimize::optimize(&polys, &opt);
+    if out.is_empty() {
+        return Err("optimizer produced no points".into());
     }
-    let vj = plan::junction_speeds(&moves, &lim, args.corner_dev);
-    for (k, m) in moves.iter_mut().enumerate() {
-        m.v_in = vj[k];
-        m.v_out = vj[k + 1];
-    }
-    write(bundle("4-plan.svg"), &viz::plan_svg(&moves, &vj, &lim))?;
+    write(bundle("2-points.svg"), viz::points_svg(&out).as_bytes())?;
 
-    // 5. simulate (FFI) + analyse
-    let pts = analyze::simulate(&moves, &lim);
-    let st = analyze::stats(&pts, &lim);
-    write(bundle("5-points.svg"), &viz::points_svg(&pts, &lim))?;
-    write(bundle("6-profile.svg"), &viz::profile_svg(&pts, &lim))?;
-    write(bundle("6-profile.csv"), &viz::to_csv(&pts, &lim))?;
+    // 3. emit → one standard ILDA frame
+    let scene = emit::build_scene(
+        &out,
+        &EmitOptions {
+            amplitude: args.amplitude,
+            intensity: args.intensity,
+        },
+    );
+    let stem = args
+        .input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("scene");
+    let ild = emit::encode_ild(&scene, stem);
 
-    // 6. emit
-    let bytes = emit::encode_scene(&moves, &lim, &EmitOptions { intensity: args.intensity });
+    write(args.output.clone(), &ild)?;
+    write(bundle("scene.ild"), &ild)?;
 
-    let vmaxf = lim.v_max_cps as f64;
-    let amaxf = lim.a_max_cps2 as f64;
+    let blanks = scene.iter().filter(|p| p.blank).count();
+    let refresh = if scene.is_empty() {
+        0.0
+    } else {
+        args.point_rate_hz / scene.len() as f64
+    };
     eprintln!(
-        "subpaths={} curves={} bytes={}  sim points={} (blank={})",
-        segmented.len(),
-        emit::curve_count(&moves),
-        bytes.len(),
-        st.points,
-        st.blanks,
+        "polylines={} flat_pts={} -> frame points={} (blank={}) ild={}B",
+        polys.len(),
+        polys.iter().map(|p| p.pts.len()).sum::<usize>(),
+        scene.len(),
+        blanks,
+        ild.len(),
     );
     eprintln!(
-        "frame≈{:.2} ms ({:.1} Hz)  peak v={:.0} ({:.0}% v_max)  a={:.0} ({:.0}% a_max)  j={:.2e}",
-        st.frame_s * 1000.0,
-        st.refresh_hz(),
-        st.max_v,
-        100.0 * st.max_v / vmaxf,
-        st.max_a,
-        100.0 * st.max_a / amaxf,
-        st.max_j,
+        "implied refresh ≈ {:.1} Hz at {:.0} pps (looped by the projector)",
+        refresh, args.point_rate_hz
     );
-    if st.refresh_hz() > 0.0 && st.refresh_hz() < 30.0 {
+    if refresh > 0.0 && refresh < 30.0 {
         eprintln!(
-            "note: {:.1} Hz is below ~30 Hz flicker — more path than the galvos can \
-             draw flicker-free at these limits; simplify or raise the limits.",
-            st.refresh_hz()
+            "note: {refresh:.1} Hz is below ~30 Hz flicker — lower --points or simplify the art."
         );
     }
-
-    let scene_out = args.output.clone().or_else(|| bundle("scene.bin"));
-    if let Some(p) = &scene_out {
-        std::fs::write(p, &bytes)?;
-        eprintln!("wrote scene -> {}", p.display());
-    } else {
+    if args.output.is_none() && debug_dir.is_none() {
         eprintln!("(no --output or --debug-output-dir; nothing written)");
     }
     Ok(())

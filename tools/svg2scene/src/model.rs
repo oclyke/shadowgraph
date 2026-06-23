@@ -1,53 +1,30 @@
-//! Shared data types that flow through the pipeline. Geometry is in DAC counts
-//! (0..65535, centre 0x8000) once fitted, held as `kurbo` curves so we get arc
-//! length, curvature, derivatives, inflections and subdivision for free.
+//! Shared data types flowing through the pipeline.
 
-use kurbo::CubicBez;
-
+/// Linear RGB in `[0,1]` per channel.
 pub type Rgb = [f32; 3];
 
-pub const GALVO_CENTER: f64 = 32768.0; // 0x8000
-
-/// A connected run of cubic Béziers (a pen-down stroke), one colour. Chained:
-/// `cubics[i].p3 == cubics[i+1].p0`.
+/// A flattened, fitted pen-down run of one colour. Positions are **normalised to
+/// `[-1,1]`, y-up** (the space `lasy` reasons about); `optimize` consumes these.
 #[derive(Clone, Debug)]
-pub struct Subpath {
+pub struct Polyline {
     pub color: Rgb,
-    pub closed: bool,
-    pub cubics: Vec<CubicBez>, // counts
+    pub pts: Vec<[f32; 2]>,
 }
 
-impl Subpath {
-    pub fn start(&self) -> kurbo::Point {
-        self.cubics.first().map(|c| c.p0).unwrap_or_default()
-    }
-    pub fn end(&self) -> kurbo::Point {
-        self.cubics.last().map(|c| c.p3).unwrap_or_default()
-    }
-    /// Reverse drawing direction (each cubic reversed, order reversed).
-    pub fn reversed(&self) -> Subpath {
-        let cubics = self
-            .cubics
-            .iter()
-            .rev()
-            .map(|c| CubicBez::new(c.p3, c.p2, c.p1, c.p0))
-            .collect();
-        Subpath {
-            color: self.color,
-            closed: self.closed,
-            cubics,
-        }
-    }
+/// One emitted ILDA point — the host mirror of the firmware `laser_point_t`
+/// (`components/point_ring`): signed 16-bit position centred at 0 (+Y up), 8-bit
+/// colour, and a blank flag. `emit` serialises this to the device blob and `.ild`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IldaPoint {
+    pub x: i16,
+    pub y: i16,
+    pub blank: bool,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
 }
 
-/// One planned move = one `CURVE` on the wire (or a blank travel move). P0 is
-/// implicit (the previous move's P3). `v_in`/`v_out` are filled by the planner
-/// (counts/second).
-#[derive(Clone, Debug)]
-pub struct Move {
-    pub cubic: CubicBez, // counts; cubic.p0 == previous move's p3
-    pub color: Rgb,
-    pub blank: bool, // true = travel move, beam off
-    pub v_in: f64,   // counts/s (0 until planned)
-    pub v_out: f64,
-}
+/// Status-byte flags — bit values identical to the firmware (`point_ring.h`) and
+/// to the ILDA status byte, so the same bits serve the blob and the `.ild`.
+pub const POINT_BLANK: u8 = 0x40; // beam off at this point
+pub const POINT_LAST: u8 = 0x80; // last point of the frame

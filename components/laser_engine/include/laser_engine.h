@@ -4,16 +4,17 @@
 #include <stdbool.h>
 #include "isr_spi.h"
 #include "dacx0004.h"   // dacx0004_add_e (channel addressing)
+#include "point_ring.h" // laser_point_t (the unit produced/consumed)
 
-// Time-ordered command engine: a renderer pushes goto/laser/dwell commands into
-// a lock-free queue; a hardware timer paces a consumer that drains the queue and
-// drives the DACs.
+// ILDA-style point-stream engine: a renderer pushes points (position + color)
+// into a lock-free ring; a hardware timer paces a consumer that pops exactly one
+// point per tick at a fixed sample rate and drives the DACs.
 //
 // The consumer runs *entirely in the gptimer ISR* — there is no output task.
-// The ISR pops commands and writes the DACs directly through isr_spi (an
-// IRAM-safe, polled SPI path), then re-arms itself for the next dwell. This
-// removes the per-dwell task wake / context-switch that used to sit between the
-// timer firing and the SPI write. See the project memory plan for the design.
+// The ISR pops a point and writes the DACs directly through isr_spi (an
+// IRAM-safe, polled SPI path). Because the cadence is a fixed auto-reload, the
+// ISR does no scheduling math or interpolation: per tick it just maps the
+// point's ILDA coordinates to galvo codes and its 8-bit color to the laser DAC.
 //
 // Threading: the producer API must be called from a SINGLE renderer task
 // (single-producer). The consumer is the single timer ISR (single-consumer).
@@ -35,32 +36,29 @@ typedef struct {
     dacx0004_add_e ch_r;         // laser channel assignments (A/B/C)
     dacx0004_add_e ch_g;
     dacx0004_add_e ch_b;
-    uint32_t       retry_us;     // re-arm interval on underrun (0 -> 1000)
+    uint32_t       point_rate_hz; // points drawn per second (0 -> 30000, ILDA 30K)
 } laser_engine_cfg_t;
 
-// Set up the queue and the gptimer (consumer ISR). The isr_spi handles in cfg
-// must already be initialized. Returns false on bad config or a setup failure.
+// Set up the point ring and the gptimer (consumer ISR) at the configured fixed
+// sample rate. The isr_spi handles in cfg must already be initialized. Returns
+// false on bad config or a setup failure.
 bool laser_engine_init(const laser_engine_cfg_t *cfg);
 
 // Put the hardware in a safe state (center galvo, blank laser) and begin
-// consuming the queue from the timer ISR.
+// consuming points from the timer ISR.
 void laser_engine_start(void);
 
-// Producer API (call from one renderer task). Each returns false if the queue
-// is full; the caller should retry or yield.
-bool laser_engine_goto (uint16_t x, uint16_t y);
-bool laser_engine_laser(uint16_t r, uint16_t g, uint16_t b);
-bool laser_engine_dwell(uint32_t dt_us);
+// Producer API (call from one renderer task). Position is ILDA-signed (center 0,
+// +Y up); color is 8-bit per channel; status carries POINT_BLANK / POINT_LAST.
+// point  returns false if the ring is full (the caller should retry or yield).
+// points pushes as many of n as fit and returns the number accepted.
+bool     laser_engine_point (const laser_point_t *p);
+uint32_t laser_engine_points(const laser_point_t *pts, uint32_t n);
 
-// Enqueue a cubic Bézier move. P0 is implicit (the engine's current position);
-// P1,P2,P3 are the control points and end (DAC counts). v_in/v_out are the
-// entry/exit speeds in WIRE units (counts per interpolation tick * 256, Q8; see
-// laser_command.h / CURVE_WIRE_V_FRAC) — the host's planner guarantees the pair is
-// reachable over the segment. The engine interpolates the setpoints in the ISR.
-bool laser_engine_curve(uint16_t x1, uint16_t y1,
-                        uint16_t x2, uint16_t y2,
-                        uint16_t x3, uint16_t y3,
-                        uint32_t v_in, uint32_t v_out);
+// Free-running count of timer ticks that found the ring empty (the producer fell
+// behind and the beam was blanked for that tick). A rising count means the
+// renderer can't keep up with point_rate_hz.
+uint32_t laser_engine_underruns(void);
 
 #ifdef __cplusplus
 }
