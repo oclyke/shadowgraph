@@ -24,14 +24,26 @@ extern "C" {
 // DMX channel map (1-based, relative to the patched base channel)
 // ---------------------------------------------------------------------------
 //   1  Mode          < 128 = pattern (Lissajous), >= 128 = stream
-//   2  Lissajous freq X   -> integer ratio 1..8
-//   3  Lissajous freq Y   -> integer ratio 1..8
+//   2  Lissajous freq X   -> base integer ratio 1..8
+//   3  Lissajous freq Y   -> base integer ratio 1..8
 //   4  Size              -> 0 .. ARTNET_AMP_MAX (galvo linear range)
-//   5  Hue               -> 0 .. 360 deg
+//   5  Hue               -> 0 .. 360 deg (base color)
 //   6  Intensity         -> 0 .. 1 (beam brightness)
 //   7  Morph rate        -> 0 .. ARTNET_MORPH_MAX_RAD_S (y-phase precession)
 //   8  Phase offset      -> 0 .. 2*pi (static y-phase)
-#define ARTNET_NUM_CHANNELS     8
+//   9  Blank width       -> 0 .. ARTNET_BLANK_WIDTH_MAX: size of a sliding gap
+//                           where the beam blanks, as a fraction of the loop
+//                           (0 = no blanking). The "aliasing" artifact.
+//  10  Blank slide rate  -> 0 .. ARTNET_BLANK_SLIDE_MAX: loop-fractions/sec the
+//                           blank gap slides through the parametric domain t
+//  11  Color-vs-t span   -> 0 .. ARTNET_COLOR_SPAN_MAX deg of hue spread ALONG
+//                           the curve (0 = one constant color)
+//  12  Color cycle rate  -> 0 .. ARTNET_COLOR_CYCLE_MAX deg/sec the color rotates
+//                           over time (independent of the y-phase morph)
+//  13  Freq X morph rate -> 0 .. ARTNET_FREQ_MORPH_RATE_MAX Hz: fx oscillates
+//  14  Freq Y morph rate -> 0 .. ARTNET_FREQ_MORPH_RATE_MAX Hz: fy oscillates
+//  15  Freq morph depth  -> 0 .. ARTNET_FREQ_MORPH_DEPTH_MAX: +/- added to fx/fy
+#define ARTNET_NUM_CHANNELS     15
 
 #define ARTNET_FREQ_MIN         1u
 #define ARTNET_FREQ_MAX         8u
@@ -39,7 +51,13 @@ extern "C" {
 // stay linear; matches the original demo's GALVO_AMPLITUDE).
 #define ARTNET_AMP_MAX          13107
 // Max y-phase precession rate the morph channel maps to.
-#define ARTNET_MORPH_MAX_RAD_S  3.0f
+#define ARTNET_MORPH_MAX_RAD_S      3.0f
+#define ARTNET_BLANK_WIDTH_MAX      0.95f   // never blank the entire loop
+#define ARTNET_BLANK_SLIDE_MAX      2.0f    // loop traversals / sec
+#define ARTNET_COLOR_SPAN_MAX       720.0f  // up to two full hue wheels across t
+#define ARTNET_COLOR_CYCLE_MAX      180.0f  // hue deg / sec over time
+#define ARTNET_FREQ_MORPH_RATE_MAX  1.0f    // Hz
+#define ARTNET_FREQ_MORPH_DEPTH_MAX 4.0f    // +/- added to base fx/fy
 
 typedef enum {
     ARTNET_MODE_PATTERN = 0,   // trace the built-in Lissajous from the DMX settings
@@ -49,13 +67,20 @@ typedef enum {
 // Decoded control state in physical units, ready for the renderer to consume.
 typedef struct {
     artnet_mode_t mode;
-    uint8_t       fx;          // Lissajous X frequency ratio (1..8)
-    uint8_t       fy;          // Lissajous Y frequency ratio (1..8)
+    uint8_t       fx;          // Lissajous X base frequency ratio (1..8)
+    uint8_t       fy;          // Lissajous Y base frequency ratio (1..8)
     int16_t       amplitude;   // figure size in ILDA units (0..ARTNET_AMP_MAX)
-    float         hue_deg;     // color hue, 0..360
+    float         hue_deg;     // base color hue, 0..360
     float         intensity;   // beam brightness, 0..1
     float         morph_rate;  // y-phase precession, rad/s
     float         phase_off;   // static y-phase offset, rad
+    float         blank_width;      // sliding blank gap size, fraction of loop (0 = off)
+    float         blank_slide_rate; // loop-fractions/sec the gap slides
+    float         color_t_span;     // hue deg spread along the curve (0 = constant)
+    float         color_cycle_rate; // hue deg/sec rotation over time
+    float         fx_morph_rate;    // Hz of fx oscillation
+    float         fy_morph_rate;    // Hz of fy oscillation
+    float         freq_morph_depth; // +/- added to fx/fy at full morph
 } artnet_control_state_t;
 
 // ---------------------------------------------------------------------------

@@ -140,6 +140,8 @@ static dacx0004_idf6_arg_t laser_arg = {
 // ---------------------------------------------------------------------------
 static void hsv_to_rgb8(float h, float value, uint8_t *r, uint8_t *g, uint8_t *b)
 {
+    h = fmodf(h, 360.0f);               // wrap: callers add spans/cycling to hue
+    if (h < 0.0f) h += 360.0f;
     const float c  = value;             // chroma = V * S  (S = 1)
     const float hp = h / 60.0f;
     const float x  = c * (1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f));
@@ -162,31 +164,76 @@ static void hsv_to_rgb8(float h, float value, uint8_t *r, uint8_t *g, uint8_t *b
 // off the critical path in build_frame at the (much lower) rebuild cadence.
 static laser_point_t s_frame[POINTS_PER_LOOP];
 
-// Evaluate the Lissajous for the current control state + morph phase into
-// s_frame. Called once per FRAMES_PER_REBUILD displayed loops, so its sinf cost
-// is ~30 Hz, not per output point. Shape (fx/fy), size, color, and phase offset
-// all come from the live Art-Net state; color is constant within a frame.
-static void build_frame(const artnet_control_state_t *st, float phase)
+// Time-varying phases the renderer advances between rebuilds. Each wraps within
+// its own period so it never loses float precision (cf. a free-running clock).
+typedef struct {
+    float y_phase;      // y-axis morph precession (rad)
+    float blank_pos;    // leading edge of the sliding blank gap, loop fraction [0,1)
+    float color_phase;  // color rotation over time (deg)
+    float fx_phase;     // fx morph oscillator phase (rad)
+    float fy_phase;     // fy morph oscillator phase (rad)
+} render_dyn_t;
+
+// Evaluate the Lissajous for the current control state + dynamic phases into
+// s_frame. Called once per FRAMES_PER_REBUILD displayed loops, so the per-point
+// trig stays off the hot path. On top of the base figure it applies three live
+// effects from the Art-Net state:
+//   - a sliding blank gap (blank_width/_pos): an "aliasing" window in the
+//     parametric domain where the beam blanks;
+//   - color as a function of t (color_t_span) that also rotates over time
+//     (color_phase);
+//   - fx/fy morph: the frequencies oscillate around their base, so the figure
+//     evolves. A morphed figure no longer closes, so the loop seam is blanked to
+//     hide the flyback.
+static void build_frame(const artnet_control_state_t *st, const render_dyn_t *d)
 {
     const float two_pi = (float)(2.0 * M_PI);
-    const float t_step = two_pi / POINTS_PER_LOOP;
 
-    uint8_t r, g, b;
-    hsv_to_rgb8(st->hue_deg, st->intensity, &r, &g, &b);
+    // Effective frequencies, optionally morphing around the integer base.
+    float fx = (float)st->fx;
+    float fy = (float)st->fy;
+    if (st->freq_morph_depth > 0.0f) {
+        if (st->fx_morph_rate > 0.0f) fx += st->freq_morph_depth * sinf(d->fx_phase);
+        if (st->fy_morph_rate > 0.0f) fy += st->freq_morph_depth * sinf(d->fy_phase);
+    }
+    const bool blank_seam = st->freq_morph_depth > 0.0f &&
+                            (st->fx_morph_rate > 0.0f || st->fy_morph_rate > 0.0f);
 
     const float amp  = (float)st->amplitude;
-    const float yoff = phase + st->phase_off;
+    const float yoff = d->y_phase + st->phase_off;
+    const float bw   = st->blank_width;            // 0 = no blanking
+    const bool  color_per_point = st->color_t_span > 0.0f;
+
+    // Constant color (no t-dependence) is computed once; the time rotation still
+    // applies via color_phase.
+    uint8_t r = 0, g = 0, b = 0;
+    if (!color_per_point)
+        hsv_to_rgb8(st->hue_deg + d->color_phase, st->intensity, &r, &g, &b);
+
     for (int i = 0; i < POINTS_PER_LOOP; i++) {
-        const float t = i * t_step;
+        const float u = (float)i / POINTS_PER_LOOP;   // parametric position [0,1)
+        const float t = u * two_pi;
+
+        uint8_t status = 0;
+        if (bw > 0.0f) {
+            float dpos = u - d->blank_pos;
+            dpos -= floorf(dpos);                     // distance ahead of the gap edge, [0,1)
+            if (dpos < bw) status = POINT_BLANK;
+        }
+        if (color_per_point) {
+            hsv_to_rgb8(st->hue_deg + d->color_phase + u * st->color_t_span,
+                        st->intensity, &r, &g, &b);
+        }
         s_frame[i] = (laser_point_t){
-            .x      = (int16_t)(amp * sinf((float)st->fx * t)),
-            .y      = (int16_t)(amp * sinf((float)st->fy * t + yoff)),
-            .status = 0,
+            .x      = (int16_t)(amp * sinf(fx * t)),
+            .y      = (int16_t)(amp * sinf(fy * t + yoff)),
+            .status = status,
             .r      = r,
             .g      = g,
             .b      = b,
         };
     }
+    if (blank_seam) s_frame[0].status |= POINT_BLANK;
 }
 
 // ---------------------------------------------------------------------------
@@ -202,8 +249,8 @@ static void render_task(void *arg)
     (void)arg;
 
     const float two_pi = (float)(2.0 * M_PI);
-    float phase = 0.0f;
-    int   f     = 0;   // displayed-loop counter within the current rebuild cycle
+    render_dyn_t dyn = {0};
+    int   f = 0;   // displayed-loop counter within the current rebuild cycle
 
     for (;;) {
         artnet_control_state_t st;
@@ -229,7 +276,7 @@ static void render_task(void *arg)
         // of each rebuild cycle, then bulk-push it. Rebuilding every
         // FRAMES_PER_REBUILD loops keeps the per-point trig off the hot path and
         // still picks up fader moves within a few tens of ms.
-        if (f == 0) build_frame(&st, phase);
+        if (f == 0) build_frame(&st, &dyn);
 
         uint32_t pushed = 0;
         while (pushed < POINTS_PER_LOOP) {
@@ -239,9 +286,15 @@ static void render_task(void *arg)
 
         if (++f >= FRAMES_PER_REBUILD) {
             f = 0;
+            // Advance each animated phase by the wall-clock time those loops took,
+            // then wrap it within its own period (no precision drift over time).
             const float dt = FRAMES_PER_REBUILD * POINTS_PER_LOOP * POINT_PERIOD_S;
-            phase += st.morph_rate * dt;
-            while (phase >= two_pi) phase -= two_pi;
+            dyn.y_phase     = fmodf(dyn.y_phase + st.morph_rate * dt, two_pi);
+            dyn.color_phase = fmodf(dyn.color_phase + st.color_cycle_rate * dt, 360.0f);
+            dyn.fx_phase    = fmodf(dyn.fx_phase + two_pi * st.fx_morph_rate * dt, two_pi);
+            dyn.fy_phase    = fmodf(dyn.fy_phase + two_pi * st.fy_morph_rate * dt, two_pi);
+            dyn.blank_pos  += st.blank_slide_rate * dt;
+            dyn.blank_pos  -= floorf(dyn.blank_pos);   // keep in [0,1)
         }
     }
 }

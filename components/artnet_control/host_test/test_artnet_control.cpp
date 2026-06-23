@@ -135,6 +135,35 @@ TEST(ArtnetDecode, ScalarChannelsMapToPhysicalUnits)
     EXPECT_NEAR(st.morph_rate, ARTNET_MORPH_MAX_RAD_S, 0.01f);
 }
 
+TEST(ArtnetDecode, EffectsChannelsMapToPhysicalUnits)
+{
+    std::vector<uint8_t> dmx(ARTNET_NUM_CHANNELS, 0);
+    dmx[8]  = 255;  // blank width
+    dmx[9]  = 255;  // blank slide rate
+    dmx[10] = 255;  // color-vs-t span
+    dmx[11] = 255;  // color cycle rate
+    dmx[12] = 255;  // fx morph rate
+    dmx[13] = 255;  // fy morph rate
+    dmx[14] = 255;  // freq morph depth
+    artnet_control_state_t st;
+    artnet_control_decode(dmx.data(), dmx.size(), 1, &st);
+
+    EXPECT_NEAR(st.blank_width, ARTNET_BLANK_WIDTH_MAX, 0.01f);
+    EXPECT_NEAR(st.blank_slide_rate, ARTNET_BLANK_SLIDE_MAX, 0.01f);
+    EXPECT_NEAR(st.color_t_span, ARTNET_COLOR_SPAN_MAX, 0.1f);
+    EXPECT_NEAR(st.color_cycle_rate, ARTNET_COLOR_CYCLE_MAX, 0.1f);
+    EXPECT_NEAR(st.fx_morph_rate, ARTNET_FREQ_MORPH_RATE_MAX, 0.01f);
+    EXPECT_NEAR(st.fy_morph_rate, ARTNET_FREQ_MORPH_RATE_MAX, 0.01f);
+    EXPECT_NEAR(st.freq_morph_depth, ARTNET_FREQ_MORPH_DEPTH_MAX, 0.01f);
+
+    // All-zero channels -> every effect off (the plain Lissajous).
+    std::vector<uint8_t> zero(ARTNET_NUM_CHANNELS, 0);
+    artnet_control_decode(zero.data(), zero.size(), 1, &st);
+    EXPECT_EQ(st.blank_width, 0.0f);
+    EXPECT_EQ(st.color_t_span, 0.0f);
+    EXPECT_EQ(st.freq_morph_depth, 0.0f);
+}
+
 TEST(ArtnetDecode, HonorsBaseChannel)
 {
     // Patch the fixture at channel 10: mode byte lives at index 9.

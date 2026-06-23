@@ -1,23 +1,31 @@
 //! artnetctl — drive the shadowgraph laser over Art-Net.
 //!
-//! Sends an Art-Net ArtDmx packet that sets the device's control fixture: the
-//! render mode (pattern vs stream) plus the built-in Lissajous settings. The
-//! device holds the last values it received, so a single invocation is enough —
-//! by default we send a short burst (UDP is lossy) and exit. `--watch` keeps
-//! streaming so you can sweep a value live.
+//! Sets the device's control fixture: the render mode (pattern vs stream) plus
+//! the Lissajous settings and effects. Art-Net/DMX is a *full-frame* protocol —
+//! every packet carries the whole universe and the device replaces its state
+//! from it — so to behave like "just change what I name", `artnetctl` remembers
+//! the last frame it sent (per universe+base, under ~/.cache/artnetctl) and
+//! merges only the flags you pass this run on top of it. Unmentioned channels
+//! keep their previous values. `--reset` starts from the built-in defaults.
+//!
+//! The device holds the last frame it received, so one invocation is enough; we
+//! send a short burst (UDP is lossy) and exit. `--watch` keeps streaming.
 //!
 //! Channel map (1-based, relative to `--base`), matching components/artnet_control:
 //!   1 mode  2 freqX  3 freqY  4 size  5 hue  6 intensity  7 morph  8 phase
+//!   9 blank-width  10 blank-slide  11 color-span  12 color-cycle
+//!   13 fx-morph  14 fy-morph  15 freq-depth
 //!
 //! Examples:
-//!   # switch to the streamed scene
-//!   artnetctl --host 192.168.1.50 --mode stream
+//!   # find the device, switch to the streamed scene
+//!   artnetctl --host auto --mode stream
 //!   # a red 5:4 Lissajous at half size, slow morph
-//!   artnetctl --host 192.168.1.50 --fx 5 --fy 4 --size 0.5 --hue 0 --morph 0.2
-//!   # broadcast (default host) and keep sending at 40 Hz
-//!   artnetctl --watch --intensity 0.6
+//!   artnetctl --host shadowgraph.local --fx 5 --fy 4 --size 0.5 --morph 0.2
+//!   # now JUST add a sliding blank gap — everything else is left as-is
+//!   artnetctl --host shadowgraph.local --blank-width 0.2 --blank-slide 0.3
 
 use std::net::{Ipv4Addr, UdpSocket};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -25,7 +33,24 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 
 const ARTNET_PORT: u16 = 6454;
-const NUM_CHANNELS: usize = 8;
+const NUM_CHANNELS: usize = 15;
+
+// Channel indices within the fixture (0-based), matching the firmware decode.
+const CH_MODE: usize = 0;
+const CH_FX: usize = 1;
+const CH_FY: usize = 2;
+const CH_SIZE: usize = 3;
+const CH_HUE: usize = 4;
+const CH_INTENSITY: usize = 5;
+const CH_MORPH: usize = 6;
+const CH_PHASE: usize = 7;
+const CH_BLANK_WIDTH: usize = 8;
+const CH_BLANK_SLIDE: usize = 9;
+const CH_COLOR_SPAN: usize = 10;
+const CH_COLOR_CYCLE: usize = 11;
+const CH_FX_MORPH: usize = 12;
+const CH_FY_MORPH: usize = 13;
+const CH_FREQ_DEPTH: usize = 14;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -37,7 +62,8 @@ enum Mode {
 
 #[derive(Parser, Debug)]
 #[command(name = "artnetctl", version,
-          about = "Drive the shadowgraph laser over Art-Net (mode toggle + Lissajous settings).")]
+          about = "Drive the shadowgraph laser over Art-Net (mode + Lissajous/effects). \
+                   Only the options you pass change; the rest keep their last values.")]
 struct Args {
     /// Device address: "ip", "ip:port", "name.local" (mDNS), or "auto" to find it
     /// via ArtPoll discovery. Defaults to the Art-Net broadcast address.
@@ -50,30 +76,58 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     base: u16,
 
-    /// Render mode (channel 1).
-    #[arg(long, value_enum, default_value_t = Mode::Pattern)]
-    mode: Mode,
-    /// Lissajous X frequency ratio, 1..8 (channel 2).
-    #[arg(long, default_value_t = 3)]
-    fx: u8,
-    /// Lissajous Y frequency ratio, 1..8 (channel 3).
-    #[arg(long, default_value_t = 2)]
-    fy: u8,
+    // --- Fixture settings. Each is optional: unset = leave that channel at its
+    //     last-sent value (merged from the saved frame). ---
+    /// Render mode: pattern | stream (channel 1).
+    #[arg(long, value_enum)]
+    mode: Option<Mode>,
+    /// Lissajous X base frequency ratio, 1..8 (channel 2).
+    #[arg(long)]
+    fx: Option<u8>,
+    /// Lissajous Y base frequency ratio, 1..8 (channel 3).
+    #[arg(long)]
+    fy: Option<u8>,
     /// Figure size as a fraction of the galvo's linear range, 0..1 (channel 4).
-    #[arg(long, default_value_t = 0.8)]
-    size: f32,
-    /// Color hue in degrees, 0..360 (channel 5).
-    #[arg(long, default_value_t = 0.0)]
-    hue: f32,
+    #[arg(long)]
+    size: Option<f32>,
+    /// Base color hue in degrees, 0..360 (channel 5).
+    #[arg(long)]
+    hue: Option<f32>,
     /// Beam intensity / brightness, 0..1 (channel 6).
-    #[arg(long, default_value_t = 0.25)]
-    intensity: f32,
+    #[arg(long)]
+    intensity: Option<f32>,
     /// Y-phase morph (animation) speed as a fraction of max, 0..1 (channel 7).
-    #[arg(long, default_value_t = 0.33)]
-    morph: f32,
+    #[arg(long)]
+    morph: Option<f32>,
     /// Static y-phase offset in degrees, 0..360 (channel 8).
-    #[arg(long, default_value_t = 0.0)]
-    phase: f32,
+    #[arg(long)]
+    phase: Option<f32>,
+    /// Sliding blank-gap width as a fraction of max, 0..1 (channel 9; 0 = off).
+    #[arg(long)]
+    blank_width: Option<f32>,
+    /// Blank-gap slide speed as a fraction of max, 0..1 (channel 10).
+    #[arg(long)]
+    blank_slide: Option<f32>,
+    /// Hue spread along the curve as a fraction of max, 0..1 (channel 11; 0 = constant).
+    #[arg(long)]
+    color_span: Option<f32>,
+    /// Color rotation-over-time speed as a fraction of max, 0..1 (channel 12).
+    #[arg(long)]
+    color_cycle: Option<f32>,
+    /// fx morph (oscillation) rate as a fraction of max, 0..1 (channel 13).
+    #[arg(long)]
+    fx_morph: Option<f32>,
+    /// fy morph (oscillation) rate as a fraction of max, 0..1 (channel 14).
+    #[arg(long)]
+    fy_morph: Option<f32>,
+    /// fx/fy morph depth as a fraction of max, 0..1 (channel 15).
+    #[arg(long)]
+    freq_depth: Option<f32>,
+
+    /// Ignore the saved frame and start from the built-in defaults before applying
+    /// any options above.
+    #[arg(long)]
+    reset: bool,
 
     /// Number of identical packets to send (UDP is lossy; the device holds state).
     #[arg(long, default_value_t = 3)]
@@ -84,7 +138,7 @@ struct Args {
     /// Refresh rate for --watch, in packets per second.
     #[arg(long, default_value_t = 40.0)]
     hz: f64,
-    /// Print the DMX channels and the packet bytes without sending.
+    /// Print the resulting frame without sending (does not update the saved state).
     #[arg(long)]
     dry_run: bool,
 
@@ -115,18 +169,75 @@ fn freq_to_dmx(f: u8) -> u8 {
     v.min(255) as u8
 }
 
-/// Build the fixture's DMX channels in map order.
-fn channels(a: &Args) -> [u8; NUM_CHANNELS] {
-    [
-        if a.mode == Mode::Stream { 255 } else { 0 },
-        freq_to_dmx(a.fx),
-        freq_to_dmx(a.fy),
-        frac_to_dmx(a.size),
-        frac_to_dmx(a.hue / 360.0),
-        frac_to_dmx(a.intensity),
-        frac_to_dmx(a.morph),
-        frac_to_dmx(a.phase / 360.0),
-    ]
+/// The baseline frame used on first run / `--reset`: the plain morphing Lissajous
+/// (pattern, 3:2, ~full size, 25% intensity, gentle morph) with effects off.
+fn default_channels() -> [u8; NUM_CHANNELS] {
+    let mut c = [0u8; NUM_CHANNELS];
+    c[CH_FX] = freq_to_dmx(3);
+    c[CH_FY] = freq_to_dmx(2);
+    c[CH_SIZE] = frac_to_dmx(0.8);
+    c[CH_INTENSITY] = frac_to_dmx(0.25);
+    c[CH_MORPH] = frac_to_dmx(0.33);
+    c
+}
+
+/// Apply the options the user actually passed onto `ch`, returning a human list
+/// of what changed (for the status line).
+fn apply_overrides(ch: &mut [u8; NUM_CHANNELS], a: &Args) -> Vec<String> {
+    let mut changed: Vec<String> = Vec::new();
+    if let Some(m) = a.mode {
+        ch[CH_MODE] = if m == Mode::Stream { 255 } else { 0 };
+        changed.push(format!("mode={}", if m == Mode::Stream { "stream" } else { "pattern" }));
+    }
+    if let Some(v) = a.fx { ch[CH_FX] = freq_to_dmx(v); changed.push(format!("fx={v}")); }
+    if let Some(v) = a.fy { ch[CH_FY] = freq_to_dmx(v); changed.push(format!("fy={v}")); }
+    if let Some(v) = a.size { ch[CH_SIZE] = frac_to_dmx(v); changed.push(format!("size={v}")); }
+    if let Some(v) = a.hue { ch[CH_HUE] = frac_to_dmx(v / 360.0); changed.push(format!("hue={v}")); }
+    if let Some(v) = a.intensity { ch[CH_INTENSITY] = frac_to_dmx(v); changed.push(format!("intensity={v}")); }
+    if let Some(v) = a.morph { ch[CH_MORPH] = frac_to_dmx(v); changed.push(format!("morph={v}")); }
+    if let Some(v) = a.phase { ch[CH_PHASE] = frac_to_dmx(v / 360.0); changed.push(format!("phase={v}")); }
+    if let Some(v) = a.blank_width { ch[CH_BLANK_WIDTH] = frac_to_dmx(v); changed.push(format!("blank-width={v}")); }
+    if let Some(v) = a.blank_slide { ch[CH_BLANK_SLIDE] = frac_to_dmx(v); changed.push(format!("blank-slide={v}")); }
+    if let Some(v) = a.color_span { ch[CH_COLOR_SPAN] = frac_to_dmx(v); changed.push(format!("color-span={v}")); }
+    if let Some(v) = a.color_cycle { ch[CH_COLOR_CYCLE] = frac_to_dmx(v); changed.push(format!("color-cycle={v}")); }
+    if let Some(v) = a.fx_morph { ch[CH_FX_MORPH] = frac_to_dmx(v); changed.push(format!("fx-morph={v}")); }
+    if let Some(v) = a.fy_morph { ch[CH_FY_MORPH] = frac_to_dmx(v); changed.push(format!("fy-morph={v}")); }
+    if let Some(v) = a.freq_depth { ch[CH_FREQ_DEPTH] = frac_to_dmx(v); changed.push(format!("freq-depth={v}")); }
+    changed
+}
+
+/// Cache file holding the last frame sent for a given universe+base.
+fn state_path(universe: u16, base: u16) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let mut p = PathBuf::from(home);
+    p.push(".cache");
+    p.push("artnetctl");
+    p.push(format!("u{universe}_b{base}.dmx"));
+    Some(p)
+}
+
+/// Load the last frame sent (per universe+base), or the defaults if there's none.
+fn load_channels(universe: u16, base: u16) -> [u8; NUM_CHANNELS] {
+    if let Some(p) = state_path(universe, base) {
+        if let Ok(bytes) = std::fs::read(&p) {
+            if bytes.len() == NUM_CHANNELS {
+                let mut c = [0u8; NUM_CHANNELS];
+                c.copy_from_slice(&bytes);
+                return c;
+            }
+        }
+    }
+    default_channels()
+}
+
+/// Persist the frame just sent so the next run can merge onto it.
+fn save_channels(universe: u16, base: u16, ch: &[u8; NUM_CHANNELS]) {
+    if let Some(p) = state_path(universe, base) {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&p, ch);
+    }
 }
 
 /// Place the fixture channels at `base` within a DMX frame. Art-Net slot counts
@@ -285,25 +396,38 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let ch = channels(&args);
-    let dmx = dmx_frame(args.base, &ch);
+    // Merge this run's options onto the last frame sent (or the defaults).
+    let mut ch = if args.reset {
+        default_channels()
+    } else {
+        load_channels(args.universe, args.base)
+    };
+    let changed = apply_overrides(&mut ch, &args);
 
-    println!(
-        "fixture @ universe {} base ch {}: mode={:?} fx={} fy={} size={:.2} \
-         hue={:.0} intensity={:.2} morph={:.2} phase={:.0}",
-        args.universe, args.base, args.mode, args.fx, args.fy, args.size, args.hue,
-        args.intensity, args.morph, args.phase
-    );
-    println!(
-        "  DMX -> mode={} freqX={} freqY={} size={} hue={} intensity={} morph={} phase={}",
-        ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7]
-    );
+    if args.reset {
+        print!("reset to defaults");
+        if !changed.is_empty() {
+            print!(", then {}", changed.join(" "));
+        }
+        println!();
+    } else if changed.is_empty() {
+        println!(
+            "no settings given — resending the last frame for universe {} base {}",
+            args.universe, args.base
+        );
+    } else {
+        println!("updating: {}", changed.join(" "));
+    }
+    let dmx_dump = ch.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" ");
+    println!("frame (universe {} base {}): {dmx_dump}", args.universe, args.base);
+
+    let dmx = dmx_frame(args.base, &ch);
 
     if args.dry_run {
         let pkt = build_artdmx(1, args.universe, &dmx);
-        println!("  packet ({} bytes): {}", pkt.len(),
+        println!("packet ({} bytes): {}", pkt.len(),
                  pkt.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
-        return ExitCode::SUCCESS;
+        return ExitCode::SUCCESS; // preview only — don't persist
     }
 
     // Resolve the target: discover it via ArtPoll when --host auto.
@@ -328,6 +452,9 @@ fn main() -> ExitCode {
     };
     // Allow broadcast targets (the default host); harmless for unicast.
     let _ = sock.set_broadcast(true);
+
+    // Persist the frame we're about to send so the next run merges onto it.
+    save_channels(args.universe, args.base, &ch);
 
     let mut seq: u8 = 1;
     let send_one = |seq: u8| -> std::io::Result<()> {
@@ -384,11 +511,30 @@ mod tests {
 
     #[test]
     fn frame_places_channels_at_base_and_is_even() {
-        let ch = [10, 20, 30, 40, 50, 60, 70, 80];
+        let ch = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         let f = dmx_frame(10, &ch);
         assert_eq!(f.len() % 2, 0);
-        assert_eq!(&f[9..17], &ch); // base 10 -> index 9
+        assert_eq!(&f[9..9 + NUM_CHANNELS], &ch); // base 10 -> index 9
         assert_eq!(f[0], 0);
+    }
+
+    #[test]
+    fn overrides_only_touch_named_channels() {
+        // The core "just write updates" property: passing one flag must change
+        // exactly its channel and leave the rest of the frame untouched.
+        let mut ch = default_channels();
+        let before = ch;
+        let args = Args::parse_from(["artnetctl", "--size", "0.5"]);
+        let changed = apply_overrides(&mut ch, &args);
+
+        assert_eq!(changed.len(), 1);
+        for i in 0..NUM_CHANNELS {
+            if i == CH_SIZE {
+                assert_ne!(ch[i], before[i]);
+            } else {
+                assert_eq!(ch[i], before[i], "channel {i} should be untouched");
+            }
+        }
     }
 
     #[test]

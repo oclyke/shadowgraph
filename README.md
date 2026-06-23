@@ -11,6 +11,15 @@ the DACs.
 ```sh
 export SHADOWGRAPH_HOST="172.20.10.2"
 ./play.sh --once tools/svg2scene/examples/chicken.svg
+
+# discover the laser on the network
+cargo run --manifest-path tools/artnetctl/Cargo.toml -- --discover --discover-ms 3000 
+
+# send some commands
+cargo run --manifest-path tools/artnetctl/Cargo.toml -- --host 172.20.10.2 --mode pattern --intensity 0.25 --fx-morph 0.3 --freq-depth 0.1 --blank-width 0.25 --blank-slide 0.2 --color-cycle 0.1 --color-span 0.2
+
+# go to stream mode for ILDA format control
+cargo run --manifest-path tools/artnetctl/Cargo.toml -- --host 172.20.10.2 --mode stream
 ```
 
 ## Hardware
@@ -130,12 +139,14 @@ idf.py fullclean
   (port 7777) that parses standard ILDA off the socket. The renderer loops the
   latest published scene.
 - **artnet_control** — an Art-Net (DMX-over-UDP, port 6454) receiver that maps a
-  DMX universe onto the device's control state: a channel selects the render
-  mode (built-in Lissajous **pattern** vs the streamed **scene**), the rest tune
-  the pattern's frequency, size, hue, intensity, and morph. Drive it from a
-  console, from QLC+/Resolume, or from the [`artnetctl`](tools/artnetctl) CLI.
-  Also answers Art-Net **ArtPoll** for discovery, so it shows up in any Art-Net
-  controller's node list (and in `artnetctl --discover`).
+  15-channel DMX fixture onto the device's control state: a channel selects the
+  render mode (built-in Lissajous **pattern** vs the streamed **scene**), the rest
+  tune the pattern's frequency, size, hue, intensity, and morph plus the
+  "aliasing" effects — a sliding blank gap, color-as-a-function-of-`t`, and
+  per-axis frequency morphing. Drive it from a console, from QLC+/Resolume, or
+  from the [`artnetctl`](tools/artnetctl) CLI. Also answers Art-Net **ArtPoll** for
+  discovery, so it shows up in any controller's node list (and `artnetctl
+  --discover`).
 
 ## Control (pattern vs. stream)
 

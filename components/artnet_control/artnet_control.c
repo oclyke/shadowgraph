@@ -124,6 +124,14 @@ void artnet_control_decode(const uint8_t *dmx, uint16_t len,
     out->intensity  = (float)ch[5] / 255.0f;
     out->morph_rate = (float)ch[6] * (ARTNET_MORPH_MAX_RAD_S / 255.0f);
     out->phase_off  = (float)ch[7] * (TWO_PI_F / 255.0f);
+
+    out->blank_width      = (float)ch[8]  * (ARTNET_BLANK_WIDTH_MAX      / 255.0f);
+    out->blank_slide_rate = (float)ch[9]  * (ARTNET_BLANK_SLIDE_MAX      / 255.0f);
+    out->color_t_span     = (float)ch[10] * (ARTNET_COLOR_SPAN_MAX       / 255.0f);
+    out->color_cycle_rate = (float)ch[11] * (ARTNET_COLOR_CYCLE_MAX      / 255.0f);
+    out->fx_morph_rate    = (float)ch[12] * (ARTNET_FREQ_MORPH_RATE_MAX  / 255.0f);
+    out->fy_morph_rate    = (float)ch[13] * (ARTNET_FREQ_MORPH_RATE_MAX  / 255.0f);
+    out->freq_morph_depth = (float)ch[14] * (ARTNET_FREQ_MORPH_DEPTH_MAX / 255.0f);
 }
 
 void artnet_control_defaults(artnet_control_state_t *out)
@@ -137,6 +145,15 @@ void artnet_control_defaults(artnet_control_state_t *out)
     out->intensity  = 0.25f;
     out->morph_rate = 1.0f;               // ~6 s per full morph
     out->phase_off  = 0.0f;
+    // New effects default off, so the out-of-the-box figure is the plain
+    // morphing Lissajous; dial them in over Art-Net.
+    out->blank_width      = 0.0f;
+    out->blank_slide_rate = 0.0f;
+    out->color_t_span     = 0.0f;
+    out->color_cycle_rate = 0.0f;
+    out->fx_morph_rate    = 0.0f;
+    out->fy_morph_rate    = 0.0f;
+    out->freq_morph_depth = 0.0f;
 }
 
 // ---------------------------------------------------------------------------
