@@ -1,7 +1,7 @@
 // shadowgraph demo: trace a morphing Lissajous "ballywhoop" on the galvos while
 // slowly cycling the laser color through the HSV hue wheel at 25% intensity.
-// Exercises the full laser_engine path end to end: queue, command codec,
-// timer-paced consumer, and galvo + laser DAC writes.
+// Exercises the full laser_engine path end to end: the point ring, the
+// fixed-rate timer ISR consumer, and galvo + laser DAC writes.
 #include <math.h>
 
 #include "freertos/FreeRTOS.h"
@@ -57,10 +57,13 @@ static const char *TAG = "shadowgraph";
 // ---------------------------------------------------------------------------
 // Demo parameters
 // ---------------------------------------------------------------------------
-#define GALVO_CENTER      0x8000    // mid-scale = zero deflection
+#define GALVO_CENTER      0x8000    // raw DAC8871 mid-scale (zero deflection),
+                                    // used only to prime the devices at startup
 
-// Stay within +/-20% of full-scale travel to keep the galvos in their linear
-// region: 0.20 * 0xFFFF ~= 13107.
+// Points are ILDA-signed (center 0, +/-32767 full scale); the engine maps them
+// to galvo DAC codes. Stay within +/-20% of full peak-to-peak travel to keep the
+// galvos in their linear region: 0.20 * 65535 ~= 13107 (same LSB as the DAC code,
+// only the origin shifts, so the physical deflection matches the old code space).
 #define GALVO_AMPLITUDE   13107
 
 // "Ballywhoop": a 3:2 Lissajous figure whose y-axis phase precesses slowly, so
@@ -68,9 +71,9 @@ static const char *TAG = "shadowgraph";
 #define LISSAJOUS_FX      3.0f
 #define LISSAJOUS_FY      2.0f
 #define POINTS_PER_LOOP   256
-#define POINT_DWELL_US    50        // 256 pts * 50 us -> ~78 Hz redraw: well
-                                    // above flicker fusion, looks continuous
-#define POINT_PERIOD_S    (POINT_DWELL_US * 1e-6f)
+#define POINT_RATE_HZ     30000     // ILDA "30K" sample rate; 256 pts -> ~117 Hz
+                                    // redraw: well above flicker fusion
+#define POINT_PERIOD_S    (1.0f / POINT_RATE_HZ)
 
 // Background animation rates in wall-clock units, so morph/color speed stay
 // constant regardless of the point rate.
@@ -126,10 +129,10 @@ static dacx0004_idf6_arg_t laser_arg = {
 };
 
 // ---------------------------------------------------------------------------
-// HSV -> 16-bit RGB, with saturation and value fixed at full (S = V = 1).
-// h is in degrees [0, 360).
+// HSV -> 8-bit RGB (ILDA color depth), with saturation and value fixed at full
+// (S = V = 1). h is in degrees [0, 360).
 // ---------------------------------------------------------------------------
-static void hsv_to_rgb16(float h, uint16_t *r, uint16_t *g, uint16_t *b)
+static void hsv_to_rgb8(float h, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     const float c  = LASER_INTENSITY;   // chroma = V * S  (V = LASER_INTENSITY, S = 1)
     const float hp = h / 60.0f;
@@ -143,15 +146,15 @@ static void hsv_to_rgb16(float h, uint16_t *r, uint16_t *g, uint16_t *b)
     else if (hp < 5.0f) { rf = x; bf = c; }
     else                { rf = c; bf = x; }
 
-    *r = (uint16_t)(rf * 0xFFFF);
-    *g = (uint16_t)(gf * 0xFFFF);
-    *b = (uint16_t)(bf * 0xFFFF);
+    *r = (uint8_t)(rf * 0xFF);
+    *g = (uint8_t)(gf * 0xFF);
+    *b = (uint8_t)(bf * 0xFF);
 }
 
 // ---------------------------------------------------------------------------
 // Renderer: trace a morphing Lissajous ("ballywhoop") while slowly cycling the
-// hue. Each point is goto + color + dwell; producer-side calls retry on a full
-// queue (the consumer drains at the dwell rate).
+// hue. Each point carries its position and color; the engine consumes one point
+// per tick at POINT_RATE_HZ. Producer-side push retries on a full ring.
 // ---------------------------------------------------------------------------
 static void render_task(void *arg)
 {
@@ -161,23 +164,24 @@ static void render_task(void *arg)
     const float t_step = two_pi / POINTS_PER_LOOP;
     float t = 0.0f, phase = 0.0f, hue = 0.0f;
     int color_div = 0;
-    uint16_t r = 0, g = 0, b = 0;
+    uint8_t r = 0, g = 0, b = 0;
 
     for (;;) {
-        int32_t x = GALVO_CENTER + (int32_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FX * t));
-        int32_t y = GALVO_CENTER + (int32_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FY * t + phase));
-
-        while (!laser_engine_goto((uint16_t)x, (uint16_t)y)) { vTaskDelay(1); }
-
-        // Color drifts slowly, so refresh it only every COLOR_EVERY points to
-        // keep per-point SPI traffic low at the high point rate.
-        if (color_div == 0) {
-            hsv_to_rgb16(hue, &r, &g, &b);
-            while (!laser_engine_laser(r, g, b)) { vTaskDelay(1); }
-        }
+        // Recompute the slowly-drifting color only every COLOR_EVERY points to
+        // keep the float work down at the high point rate; the value still
+        // travels with every point.
+        if (color_div == 0) hsv_to_rgb8(hue, &r, &g, &b);
         if (++color_div >= COLOR_EVERY) color_div = 0;
 
-        while (!laser_engine_dwell(POINT_DWELL_US)) { vTaskDelay(1); }
+        laser_point_t p = {
+            .x      = (int16_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FX * t)),
+            .y      = (int16_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FY * t + phase)),
+            .status = 0,
+            .r      = r,
+            .g      = g,
+            .b      = b,
+        };
+        while (!laser_engine_point(&p)) { vTaskDelay(1); }
 
         t += t_step;
         if (t >= two_pi) t -= two_pi;
@@ -249,13 +253,13 @@ void app_main(void)
     // -- Laser engine: the consumer is the gptimer ISR (no output task). It
     //    centers the galvo and blanks the laser at start. ----------------------
     laser_engine_cfg_t cfg = {
-        .galvo_x  = &isr_gx,
-        .galvo_y  = &isr_gy,
-        .laser    = &isr_laser,
-        .ch_r     = LASER_CH_RED,
-        .ch_g     = LASER_CH_GREEN,
-        .ch_b     = LASER_CH_BLUE,
-        .retry_us = 1000,
+        .galvo_x       = &isr_gx,
+        .galvo_y       = &isr_gy,
+        .laser         = &isr_laser,
+        .ch_r          = LASER_CH_RED,
+        .ch_g          = LASER_CH_GREEN,
+        .ch_b          = LASER_CH_BLUE,
+        .point_rate_hz = POINT_RATE_HZ,
     };
     if (!laser_engine_init(&cfg)) {
         ESP_LOGE(TAG, "laser_engine_init failed"); return;

@@ -34,9 +34,8 @@ shadowgraph/
 ├── components/
 │   ├── driver_dac8871/     # DAC8871 galvo driver (ESP-IDF v6 SPI/GPIO wrapper)
 │   ├── driver_dacx0004/    # DAC80004 laser driver (ESP-IDF v6 SPI/GPIO wrapper)
-│   ├── byte_queue/         # SPSC lock-free byte ring buffer
-│   ├── laser_command/      # type-value command codec over byte_queue
-│   └── laser_engine/       # command queue + timer-driven DAC consumer
+│   ├── point_ring/         # SPSC lock-free ring of ILDA points
+│   └── laser_engine/       # point ring + fixed-rate timer-ISR DAC consumer
 └── third-party/github.com/
     ├── espressif/esp-idf           # pinned ESP-IDF v6.0.1
     ├── oclyke/driver-DAC8871       # vendored galvo driver source
@@ -104,25 +103,26 @@ idf.py fullclean
 - **driver_dac8871 / driver_dacx0004** — thin ESP-IDF v6 wrappers around the
   vendored DAC driver sources. They supply the SPI/GPIO platform implementation
   (the in-tree `if_imp/esp32` code targets older IDF and is not used).
-- **byte_queue** — single-producer/single-consumer lock-free byte ring buffer.
-  Multi-byte records are published atomically via a release/acquire handoff.
-- **laser_command** — type-value codec for `goto` / `laser` / `dwell` commands
-  on top of `byte_queue`.
-- **laser_engine** — owns the command queue and the producer API
-  (`laser_engine_goto/laser/dwell`). A `gptimer` paces a high-priority consumer
-  task that decodes commands and writes the DACs (SPI runs in task context, not
-  the ISR). Blanks the laser on underrun for safety.
+- **point_ring** — single-producer/single-consumer lock-free ring of
+  `laser_point_t`, an ILDA-format point (signed-16-bit X/Y, 8-bit RGB, status).
+  Each point is published atomically via a release/acquire handoff.
+- **laser_engine** — owns the point ring and the producer API
+  (`laser_engine_point` / `laser_engine_points`). A `gptimer` auto-reload alarm
+  fires at a fixed sample rate (ILDA-style, default 30 kpps); the ISR pops one
+  point per tick, maps its ILDA coordinates to galvo DAC codes and its 8-bit
+  color to the laser DAC, and writes them via `isr_spi`. Blanks the laser on
+  underrun for safety.
 
 ## Host unit tests
 
-`byte_queue` and `laser_command` are pure C and are unit-tested on the host with
-googletest. Each has a standalone CMake project under `host_test/`:
+`point_ring` is pure C and unit-tested on the host with googletest via a
+standalone CMake project under `host_test/`:
 
 ```sh
-# from the repo root (replace byte_queue with laser_command for that suite)
-cmake -S components/byte_queue/host_test -B components/byte_queue/host_test/build
-cmake --build components/byte_queue/host_test/build
-ctest --test-dir components/byte_queue/host_test/build --output-on-failure
+# from the repo root
+cmake -S components/point_ring/host_test -B components/point_ring/host_test/build
+cmake --build components/point_ring/host_test/build
+ctest --test-dir components/point_ring/host_test/build --output-on-failure
 ```
 
 This requires the googletest submodule fetched during setup.

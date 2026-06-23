@@ -1,5 +1,4 @@
 idf_component_register(
-    SRCS "laser_command.c"
+    SRCS "point_ring.c"
     INCLUDE_DIRS "include"
-    REQUIRES byte_queue
 )
