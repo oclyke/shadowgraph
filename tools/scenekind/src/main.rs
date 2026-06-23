@@ -43,7 +43,7 @@ fn check_ilda(data: &[u8]) -> Result<(usize, Vec<u8>), String> {
     let mut formats = Vec::new();
     loop {
         if pos + 32 > data.len() {
-            return Err("ILDA stream ends without a 0-record terminator".into());
+            break; // tolerate a missing terminating header (many real files omit it)
         }
         if &data[pos..pos + 4] != b"ILDA" {
             return Err(format!("bad ILDA header at offset {pos}"));
@@ -155,9 +155,10 @@ mod tests {
     }
 
     #[test]
-    fn ilda_missing_terminator_errors() {
-        let d = section(5, 4, 8); // no terminator
-        assert!(check_ilda(&d).is_err());
+    fn ilda_missing_terminator_tolerated() {
+        let d = section(5, 4, 8); // no terminator → still valid, 1 frame
+        let (frames, _) = check_ilda(&d).unwrap();
+        assert_eq!(frames, 1);
     }
 
     #[test]
