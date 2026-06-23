@@ -1,7 +1,6 @@
-//! CLI driver: SVG → parse → flatten/fit → optimize (lasy) → emit, writing the
-//! device-native point blob and a standard `.ild`, plus an optional Bazel-style
-//! debug bundle whose stages are each visualised, and an optional `--stream` push
-//! to a running device.
+//! CLI driver: SVG → parse → flatten/fit → optimize (lasy) → emit one **ILDA
+//! frame** (`.ild`, format 5), plus an optional Bazel-style debug bundle whose
+//! stages are each visualised. Playout/streaming is a separate tool (`ildaplay`).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -11,27 +10,20 @@ use clap::Parser;
 use svg2scene::emit::{self, EmitOptions};
 use svg2scene::optimize::{self, OptimizeOptions};
 use svg2scene::parse::{self, ParseOptions};
-use svg2scene::stream;
 use svg2scene::viz;
 
-/// Convert an SVG into an ILDA-style galvo laser point stream.
+/// Convert an SVG into a single ILDA frame (.ild, format 5).
 #[derive(Parser, Debug)]
 #[command(name = "svg2scene", version)]
 struct Args {
     /// Input SVG file.
     input: PathBuf,
 
-    /// Write the device-native point blob (8-byte laser_point_t records) here.
+    /// Write the ILDA (.ild) frame here.
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Also write a standard ILDA `.ild` file (format 5) here.
-    #[arg(long)]
-    ild: Option<PathBuf>,
-    /// Stream the scene to a running device over TCP (`ip` or `ip:port`).
-    #[arg(long, value_name = "HOST")]
-    stream: Option<String>,
 
-    /// Emit the debug bundle (input/parse/points + scene.bin/.ild) and drop a
+    /// Emit the debug bundle (input/parse/points + scene.ild) and drop a
     /// convenience symlink to it here. Bare flag uses `./output`.
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "output")]
     debug_output_dir: Option<PathBuf>,
@@ -164,7 +156,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     write(bundle("2-points.svg"), viz::points_svg(&out).as_bytes())?;
 
-    // 3. emit → scene (device blob + .ild)
+    // 3. emit → one standard ILDA frame
     let scene = emit::build_scene(
         &out,
         &EmitOptions {
@@ -177,12 +169,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("scene");
-    let blob = emit::encode_blob(&scene);
     let ild = emit::encode_ild(&scene, stem);
 
-    write(args.output.clone(), &blob)?;
-    write(args.ild.clone(), &ild)?;
-    write(bundle("scene.bin"), &blob)?;
+    write(args.output.clone(), &ild)?;
     write(bundle("scene.ild"), &ild)?;
 
     let blanks = scene.iter().filter(|p| p.blank).count();
@@ -192,15 +181,15 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         args.point_rate_hz / scene.len() as f64
     };
     eprintln!(
-        "polylines={} flat_pts={} -> scene points={} (blank={}) blob={}B",
+        "polylines={} flat_pts={} -> frame points={} (blank={}) ild={}B",
         polys.len(),
         polys.iter().map(|p| p.pts.len()).sum::<usize>(),
         scene.len(),
         blanks,
-        blob.len(),
+        ild.len(),
     );
     eprintln!(
-        "implied refresh ≈ {:.1} Hz at {:.0} pps",
+        "implied refresh ≈ {:.1} Hz at {:.0} pps (looped by the projector)",
         refresh, args.point_rate_hz
     );
     if refresh > 0.0 && refresh < 30.0 {
@@ -208,15 +197,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             "note: {refresh:.1} Hz is below ~30 Hz flicker — lower --points or simplify the art."
         );
     }
-    if args.output.is_none() && args.ild.is_none() && debug_dir.is_none() && args.stream.is_none() {
-        eprintln!("(no --output/--ild/--debug-output-dir/--stream; nothing written or sent)");
-    }
-
-    // 4. optional live push
-    if let Some(host) = &args.stream {
-        eprintln!("streaming {} points to {host} …", scene.len());
-        stream::send_scene(host, &scene)?;
-        eprintln!("device acked; scene is live");
+    if args.output.is_none() && debug_dir.is_none() {
+        eprintln!("(no --output or --debug-output-dir; nothing written)");
     }
     Ok(())
 }

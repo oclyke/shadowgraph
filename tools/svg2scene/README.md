@@ -1,7 +1,9 @@
 # svg2scene
 
-Convert SVG artwork into an **ILDA-style galvo laser point stream** for the
-shadowgraph projector, and (optionally) stream it straight to the device.
+Convert SVG artwork into a single **standard ILDA frame** (`.ild`, format 5) for
+the shadowgraph projector. Playout/streaming is a separate tool — see
+[`tools/ildaplay`](../ildaplay) — which sends ILDA frames to the device at a
+frame rate; this tool only does the SVG → ILDA conversion.
 
 This is the host-side renderer for the ILDA point engine (`components/point_ring`
 `laser_point_t`, `components/laser_engine`). It produces a **dense uniform point
@@ -42,25 +44,21 @@ The bundle holds `0-input.svg`, `1-parse.svg` (fitted polylines), `2-points.svg`
 (emitted setpoints; dashed = blank travel), `scene.bin`, `scene.ild`. Render an
 SVG to PNG on macOS with `qlmanage -t -s 1000 -o /tmp output/2-points.svg`.
 
-## Streaming to the device
+## Getting it on the device
 
-The device runs a TCP scene receiver on port 7777. Its WiFi role is selected in
-`main/main.c` (`WIFI_STA_MODE`):
+`svg2scene` only writes `.ild` files. To draw one (or animate several), hand the
+frame(s) to [`ildaplay`](../ildaplay), which streams ILDA to the device and paces
+animation frames; the projector loops whichever frame it last received:
 
-- **Station (default):** the device joins the `ioio` network and gets a DHCP
-  address — read it from the serial monitor (`STA got IP …`) and stream to it:
+```sh
+# one frame, drawn and held
+cargo run --manifest-path tools/svg2scene/Cargo.toml -- examples/test.svg -o test.ild
+cargo run --manifest-path tools/ildaplay/Cargo.toml -- --host <device-ip> test.ild
+```
 
-  ```sh
-  cargo run --manifest-path tools/svg2scene/Cargo.toml -- \
-      tools/svg2scene/examples/test.svg --stream <device-ip>
-  ```
-
-- **SoftAP** (`WIFI_STA_MODE 0`): the device hosts `shadowgraph` / `letslaser`;
-  join it and stream to its fixed IP `192.168.4.1`.
-
-`--stream` sends `["SCN1"][u32 count LE][count × 8-byte laser_point_t]` and waits
-for the device's 1-byte ACK; the device then loops that scene until the next one
-arrives. Run again with a different SVG to swap the image live.
+The wire format is plain ILDA, so any conforming format-4/5 file works (even
+`nc <device-ip> 7777 < test.ild`). The device's address: in STA mode (default) it
+joins `ioio` and logs its DHCP IP at boot; in SoftAP mode it's `192.168.4.1`.
 
 ## Knobs
 

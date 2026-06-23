@@ -1,12 +1,8 @@
-//! Serialise the interpolated point stream to the two output formats:
-//!   * **device blob** — back-to-back 8-byte `laser_point_t` records,
-//!     little-endian, byte-identical to the firmware struct so the device can
-//!     `memcpy` it straight into its DRAM scene buffer.
-//!   * **`.ild`** — a standard ILDA Image Data Transfer Format file, format 5
-//!     (2D true colour), big-endian, for interop with other laser software.
-//!
-//! Both share the same status bits (`POINT_BLANK` 0x40 / `POINT_LAST` 0x80),
-//! which are identical in the firmware and in the ILDA status byte.
+//! Serialise the interpolated point stream to a standard **ILDA** file (Image
+//! Data Transfer Format, format 5 — 2D true colour, big-endian). This is the
+//! tool's native output and its wire format: the device parses ILDA directly, so
+//! the same bytes that get written to a `.ild` are what `--stream` sends. The
+//! ILDA status bits (0x80 last / 0x40 blank) are identical to the firmware's.
 
 use crate::model::{IldaPoint, POINT_BLANK, POINT_LAST};
 use crate::optimize::OutPoint;
@@ -74,22 +70,6 @@ fn status(p: &IldaPoint, last: bool) -> u8 {
     s
 }
 
-/// Device-native blob: 8-byte `laser_point_t` records, little-endian.
-/// Layout: `x i16 LE, y i16 LE, status u8, r u8, g u8, b u8`.
-pub fn encode_blob(scene: &[IldaPoint]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(scene.len() * 8);
-    let n = scene.len();
-    for (i, p) in scene.iter().enumerate() {
-        out.extend_from_slice(&p.x.to_le_bytes());
-        out.extend_from_slice(&p.y.to_le_bytes());
-        out.push(status(p, i + 1 == n));
-        out.push(p.r);
-        out.push(p.g);
-        out.push(p.b);
-    }
-    out
-}
-
 /// Standard ILDA file, format 5 (2D true colour), big-endian. One section plus a
 /// zero-record terminating header.
 pub fn encode_ild(scene: &[IldaPoint], frame_name: &str) -> Vec<u8> {
@@ -134,28 +114,6 @@ mod tests {
 
     fn lit(x: i16, y: i16, r: u8, g: u8, b: u8) -> IldaPoint {
         IldaPoint { x, y, blank: false, r, g, b }
-    }
-
-    #[test]
-    fn blob_record_layout() {
-        let scene = vec![lit(0x0102, 0x0304, 0xAA, 0xBB, 0xCC)];
-        let b = encode_blob(&scene);
-        assert_eq!(b.len(), 8);
-        assert_eq!(&b[0..2], &0x0102i16.to_le_bytes()); // x LE
-        assert_eq!(&b[2..4], &0x0304i16.to_le_bytes()); // y LE
-        assert_eq!(b[4], POINT_LAST); // sole point → last, not blank
-        assert_eq!([b[5], b[6], b[7]], [0xAA, 0xBB, 0xCC]); // r,g,b
-    }
-
-    #[test]
-    fn blob_blank_and_last_bits() {
-        let scene = vec![
-            IldaPoint { x: 1, y: 2, blank: true, r: 0, g: 0, b: 0 },
-            lit(3, 4, 1, 2, 3),
-        ];
-        let b = encode_blob(&scene);
-        assert_eq!(b[4], POINT_BLANK); // first: blanked, not last
-        assert_eq!(b[12], POINT_LAST); // second record status (offset 8+4)
     }
 
     #[test]

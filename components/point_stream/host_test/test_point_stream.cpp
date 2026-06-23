@@ -83,3 +83,42 @@ TEST(PointStream, ConsumerAndProducerSlotsDiffer) {
     point_stream_commit(1);
     EXPECT_EQ(held[0].x, 1); // unchanged while we still hold it
 }
+
+// ILDA record decode: big-endian X/Y, status (blank/last bits pass through),
+// and B,G,R order mapped to our r,g,b.
+TEST(PointStream, IldRecsize) {
+    EXPECT_EQ(point_stream_ild_recsize(5), 8u);
+    EXPECT_EQ(point_stream_ild_recsize(4), 10u);
+    EXPECT_EQ(point_stream_ild_recsize(1), 0u); // indexed: unsupported
+}
+
+TEST(PointStream, IldRecordFormat5) {
+    // X=0x0102, Y=-2, status=last|blank, B,G,R = 0xBB,0xC4,0xD5
+    uint8_t rec[8] = {0x01, 0x02, 0xFF, 0xFE, POINT_LAST | POINT_BLANK, 0xBB, 0xC4, 0xD5};
+    laser_point_t out{};
+    ASSERT_TRUE(point_stream_ild_record(5, rec, &out));
+    EXPECT_EQ(out.x, 0x0102);
+    EXPECT_EQ(out.y, -2);
+    EXPECT_EQ(out.status, POINT_LAST | POINT_BLANK);
+    EXPECT_EQ(out.b, 0xBB);
+    EXPECT_EQ(out.g, 0xC4);
+    EXPECT_EQ(out.r, 0xD5);
+}
+
+TEST(PointStream, IldRecordFormat4DropsZ) {
+    // 3D: X=0x0102, Y=3, Z=0x7FFF (ignored), status=0, B,G,R = 1,2,3
+    uint8_t rec[10] = {0x01, 0x02, 0x00, 0x03, 0x7F, 0xFF, 0x00, 0x01, 0x02, 0x03};
+    laser_point_t out{};
+    ASSERT_TRUE(point_stream_ild_record(4, rec, &out));
+    EXPECT_EQ(out.x, 0x0102);
+    EXPECT_EQ(out.y, 3);
+    EXPECT_EQ(out.b, 0x01);
+    EXPECT_EQ(out.g, 0x02);
+    EXPECT_EQ(out.r, 0x03);
+}
+
+TEST(PointStream, IldRecordRejectsUnsupported) {
+    uint8_t rec[8] = {0};
+    laser_point_t out{};
+    EXPECT_FALSE(point_stream_ild_record(1, rec, &out));
+}

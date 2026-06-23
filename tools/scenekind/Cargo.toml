@@ -1,0 +1,12 @@
+[package]
+name = "scenekind"
+version = "0.1.0"
+edition = "2021"
+description = "Classify a file as an SVG or an ILDA scene, with a structural sanity check"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+
+[[bin]]
+name = "scenekind"
+path = "src/main.rs"

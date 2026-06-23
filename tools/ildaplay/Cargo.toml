@@ -1,0 +1,12 @@
+[package]
+name = "ildaplay"
+version = "0.1.0"
+edition = "2021"
+description = "Stream ILDA frames to the shadowgraph projector at a frame rate"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+
+[[bin]]
+name = "ildaplay"
+path = "src/main.rs"

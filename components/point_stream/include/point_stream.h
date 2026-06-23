@@ -13,6 +13,12 @@
 // slot when it wants it. Producer and consumer never touch the same slot, so the
 // renderer can push the active scene into the ring with no tearing and no lock.
 //
+// Wire format: **standard ILDA** (Image Data Transfer Format). The device parses
+// 2D/3D true-colour sections (format 5 / format 4) straight off the socket, so it
+// accepts any conforming ILDA scene — not just svg2scene output (`nc dev 7777 <
+// scene.ild` works). Each data section is published as a scene; a 0-record
+// terminating header ends the stream and the device replies with a 1-byte ACK.
+//
 // Memory note: every slot lives in static .bss (internal DRAM). The renderer must
 // push points only from here (or another DRAM buffer) — never from a flash-resident
 // const — or it will stall on the flash cache (see the sin-LUT regression).
@@ -26,9 +32,15 @@ extern "C" {
 #define POINT_STREAM_MAX_PTS 2048u
 #endif
 
-// TCP wire: ["SCN1"][u32 count, little-endian][count * 8-byte laser_point_t].
-#define POINT_STREAM_MAGIC "SCN1"
-#define POINT_STREAM_ACK   0x06u
+#define POINT_STREAM_ACK   0x06u   // sent after a full ILDA stream is received
+
+// ILDA record decode (portable; used by the receiver, exposed for testing). The
+// supported true-colour formats: 5 = 2D (8-byte record), 4 = 3D (10-byte, Z
+// dropped). Returns the record size in bytes for a format, or 0 if unsupported.
+uint32_t point_stream_ild_recsize(uint8_t format);
+// Decode one ILDA data record (big-endian X/Y, status, B,G,R) into a laser_point_t.
+// Returns false for an unsupported format. `rec` must hold recsize(format) bytes.
+bool point_stream_ild_record(uint8_t format, const uint8_t *rec, laser_point_t *out);
 
 // Initialize the triple-buffer store. Call once before point_stream_start and
 // before the renderer first calls point_stream_get.

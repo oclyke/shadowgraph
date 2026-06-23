@@ -6,6 +6,13 @@ time-ordered command stream. Renderers push `goto` / `laser` / `dwell` commands
 into a lock-free queue; a hardware-timer-paced consumer task clocks them out to
 the DACs.
 
+## Getting Started
+
+```sh
+export SHADOWGRAPH_HOST="172.20.10.2"
+./play.sh --once tools/svg2scene/examples/chicken.svg
+```
+
 ## Hardware
 
 - **MCU:** original ESP32 (Xtensa LX6, dual-core)

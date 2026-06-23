@@ -76,6 +76,37 @@ bool point_stream_get(const laser_point_t **pts, uint32_t *count)
 }
 
 // ---------------------------------------------------------------------------
+// ILDA record decode (portable). ILDA true-colour records are big-endian X/Y
+// then a status byte then B,G,R; the status bits (0x80 last / 0x40 blank) are
+// identical to ours, so they pass straight through. Format 5 is 2D (status at
+// offset 4); format 4 is 3D (a 2-byte Z we drop, status at offset 6).
+// ---------------------------------------------------------------------------
+uint32_t point_stream_ild_recsize(uint8_t format)
+{
+    switch (format) {
+        case 5: return 8;   // 2D true colour
+        case 4: return 10;  // 3D true colour (Z dropped)
+        default: return 0;  // unsupported (indexed-colour 0/1/2 not handled)
+    }
+}
+
+bool point_stream_ild_record(uint8_t format, const uint8_t *rec, laser_point_t *out)
+{
+    uint32_t off;
+    if (format == 5)      off = 4;
+    else if (format == 4) off = 6;   // skip the 2-byte Z
+    else return false;
+
+    out->x      = (int16_t)(((uint16_t)rec[0] << 8) | rec[1]);
+    out->y      = (int16_t)(((uint16_t)rec[2] << 8) | rec[3]);
+    out->status = rec[off] & (POINT_BLANK | POINT_LAST);
+    out->b      = rec[off + 1];
+    out->g      = rec[off + 2];
+    out->r      = rec[off + 3];
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Device-only: the TCP scene-receiver task.
 // ---------------------------------------------------------------------------
 #if defined(ESP_PLATFORM)
@@ -121,32 +152,48 @@ static void server_task(void *arg)
         int nodelay = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        // Serve scenes on this connection until the peer closes or errors.
+        // Parse ILDA sections off the wire until a 0-record terminator (then
+        // ACK) or the peer closes. Each data section is published as a scene.
         for (;;) {
-            uint8_t hdr[8];
-            if (!recv_all(fd, hdr, sizeof(hdr))) break;
-            if (memcmp(hdr, POINT_STREAM_MAGIC, 4) != 0) {
-                ESP_LOGW(TAG, "bad magic"); break;
+            uint8_t ihdr[32];
+            if (!recv_all(fd, ihdr, sizeof(ihdr))) break;
+            if (memcmp(ihdr, "ILDA", 4) != 0) {
+                ESP_LOGW(TAG, "not an ILDA header"); break;
             }
-            uint32_t count = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) |
-                             ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
-            if (count == 0 || count > POINT_STREAM_MAX_PTS) {
-                ESP_LOGW(TAG, "bad count %u (max %u)",
-                         (unsigned)count, (unsigned)POINT_STREAM_MAX_PTS);
-                break;
-            }
-            // Receive the records straight into the DRAM back slot (zero-copy).
-            // Wire records are 8-byte little-endian laser_point_t, matching the
-            // struct on this little-endian target.
-            if (!recv_all(fd, (uint8_t *)point_stream_back(),
-                          (size_t)count * sizeof(laser_point_t))) {
-                break;
-            }
-            point_stream_commit(count);
+            uint8_t  format = ihdr[7];
+            uint32_t count  = ((uint32_t)ihdr[24] << 8) | ihdr[25];   // BE u16
 
-            uint8_t ack = POINT_STREAM_ACK;
-            send(fd, &ack, 1, 0);
-            ESP_LOGI(TAG, "scene received: %u points", (unsigned)count);
+            if (count == 0) {
+                // Terminating header: end of this ILDA stream — ack and keep the
+                // connection open for a possible next file.
+                uint8_t ack = POINT_STREAM_ACK;
+                send(fd, &ack, 1, 0);
+                continue;
+            }
+
+            uint32_t recsize = point_stream_ild_recsize(format);
+            if (recsize == 0) {
+                ESP_LOGW(TAG, "unsupported ILDA format %u", (unsigned)format);
+                break;
+            }
+
+            // Decode records into the DRAM back slot (clamped to MAX_PTS; any
+            // excess is consumed off the socket but dropped).
+            laser_point_t *back = point_stream_back();
+            uint32_t stored = 0;
+            bool ok = true;
+            for (uint32_t i = 0; i < count; i++) {
+                uint8_t rec[10];
+                if (!recv_all(fd, rec, recsize)) { ok = false; break; }
+                if (stored < POINT_STREAM_MAX_PTS) {
+                    point_stream_ild_record(format, rec, &back[stored]);
+                    stored++;
+                }
+            }
+            if (!ok) break;
+            point_stream_commit(stored);
+            ESP_LOGI(TAG, "scene: %u points (ILDA fmt %u)",
+                     (unsigned)stored, (unsigned)format);
         }
         close(fd);
     }
