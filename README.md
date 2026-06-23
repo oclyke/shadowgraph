@@ -42,7 +42,14 @@ shadowgraph/
 │   ├── driver_dac8871/     # DAC8871 galvo driver (ESP-IDF v6 SPI/GPIO wrapper)
 │   ├── driver_dacx0004/    # DAC80004 laser driver (ESP-IDF v6 SPI/GPIO wrapper)
 │   ├── point_ring/         # SPSC lock-free ring of ILDA points
-│   └── laser_engine/       # point ring + fixed-rate timer-ISR DAC consumer
+│   ├── laser_engine/       # point ring + fixed-rate timer-ISR DAC consumer
+│   ├── point_stream/       # triple-buffered scene store + TCP ILDA receiver
+│   ├── artnet_control/     # Art-Net receiver -> render mode + Lissajous settings
+│   └── wifi_ap/            # WiFi bring-up (SoftAP or station)
+├── tools/
+│   ├── svg2scene/          # SVG -> ILDA scene
+│   ├── ildaplay/           # stream ILDA frames to the device
+│   └── artnetctl/          # Art-Net control: mode toggle + Lissajous settings
 └── third-party/github.com/
     ├── espressif/esp-idf           # pinned ESP-IDF v6.0.1
     ├── oclyke/driver-DAC8871       # vendored galvo driver source
@@ -119,6 +126,32 @@ idf.py fullclean
   point per tick, maps its ILDA coordinates to galvo DAC codes and its 8-bit
   color to the laser DAC, and writes them via `isr_spi`. Blanks the laser on
   underrun for safety.
+- **point_stream** — triple-buffered DRAM scene store plus a TCP receiver
+  (port 7777) that parses standard ILDA off the socket. The renderer loops the
+  latest published scene.
+- **artnet_control** — an Art-Net (DMX-over-UDP, port 6454) receiver that maps a
+  DMX universe onto the device's control state: a channel selects the render
+  mode (built-in Lissajous **pattern** vs the streamed **scene**), the rest tune
+  the pattern's frequency, size, hue, intensity, and morph. Drive it from a
+  console, from QLC+/Resolume, or from the [`artnetctl`](tools/artnetctl) CLI.
+
+## Control (pattern vs. stream)
+
+The projector starts on its built-in Lissajous and switches to the streamed
+scene on command — both selected at runtime over Art-Net, no reflash:
+
+```sh
+# point at the streamed scene, then push frames
+cargo run --manifest-path tools/artnetctl/Cargo.toml -- --host <device-ip> --mode stream
+./play.sh --once tools/svg2scene/examples/chicken.svg
+
+# back to a live pattern (5:4 Lissajous, half size, slow morph)
+cargo run --manifest-path tools/artnetctl/Cargo.toml -- \
+    --host <device-ip> --mode pattern --fx 5 --fy 4 --size 0.5 --morph 0.2
+```
+
+See [`tools/artnetctl`](tools/artnetctl) for the full option list and the DMX
+channel map.
 
 ## Host unit tests
 
@@ -132,4 +165,7 @@ cmake --build components/point_ring/host_test/build
 ctest --test-dir components/point_ring/host_test/build --output-on-failure
 ```
 
-This requires the googletest submodule fetched during setup.
+This requires the googletest submodule fetched during setup. `point_stream` and
+`artnet_control` carry their own `host_test/` projects too (the Art-Net parser
+and DMX decode, the ILDA record decode and triple buffer) — build them the same
+way, swapping in the component path.

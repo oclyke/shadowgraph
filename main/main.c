@@ -1,7 +1,10 @@
-// shadowgraph: drive the galvos + laser from an ILDA-style point stream. By
-// default the device brings up its SoftAP and a TCP scene receiver, then loops
-// whatever scene the host last streamed (see tools/svg2scene --stream). A
-// compile-time fallback (RENDER_DEMO) traces a built-in Lissajous instead.
+// shadowgraph: drive the galvos + laser from an ILDA-style point stream. The
+// device brings up WiFi, a TCP scene receiver (tools/svg2scene + ildaplay), and
+// an Art-Net control receiver (tools/artnetctl). The renderer chooses its source
+// at runtime from the Art-Net control state: trace a built-in Lissajous
+// ("pattern"), or loop the last scene streamed in ("stream"). It starts on the
+// pattern with offline defaults until a console says otherwise; ENABLE_NET 0
+// drops all networking and just traces the default pattern.
 #include <math.h>
 
 #include "freertos/FreeRTOS.h"
@@ -12,20 +15,27 @@
 #include "dac8871_idf6.h"
 #include "dacx0004_idf6.h"
 #include "isr_spi.h"
+#include "artnet_control.h"
 #include "laser_engine.h"
 #include "point_stream.h"
 #include "wifi_ap.h"
 
 static const char *TAG = "shadowgraph";
 
-// Scene source: 0 = stream scenes over TCP (needs WiFi); 1 = built-in Lissajous
-// demo (offline fallback, no networking).
-#define RENDER_DEMO     0
+// Networking: 1 = bring up WiFi plus the TCP scene receiver and the Art-Net
+// control receiver; 0 = fully offline (no radio), tracing the built-in Lissajous
+// from its defaults. With networking up the live mode is chosen at runtime over
+// Art-Net (control channel 1): pattern (Lissajous) vs stream.
+#define ENABLE_NET      1
 #define SCENE_TCP_PORT  7777
-#define ENABLE_WIFI     (!RENDER_DEMO)
 // WiFi role: 1 = join the "ioio" network as a station (device + host share that
 // LAN; stream to the DHCP IP logged at boot); 0 = host our own SoftAP.
 #define WIFI_STA_MODE   1
+
+// Art-Net control fixture: the DMX universe we listen on and the 1-based slot of
+// its first channel (see components/artnet_control for the channel map).
+#define ARTNET_UNIVERSE      1
+#define ARTNET_BASE_CHANNEL  1
 
 // ---------------------------------------------------------------------------
 // Galvo SPI bus  (SPI2 / HSPI) — two DAC8871s share the bus
@@ -69,23 +79,18 @@ static const char *TAG = "shadowgraph";
                                     // used only to prime the devices at startup
 #define POINT_RATE_HZ     30000     // ILDA "30K" sample rate (engine cadence)
 
-#if RENDER_DEMO
-// Lissajous "ballywhoop" demo parameters (offline fallback). Points are ILDA-
-// signed (center 0); stay within ~±20% of full travel to keep the galvos linear
-// (0.20 * 65535 ~= 13107).
-#define GALVO_AMPLITUDE   13107
-#define LISSAJOUS_FX      3.0f
-#define LISSAJOUS_FY      2.0f
-#define POINTS_PER_LOOP   256
-#define POINT_PERIOD_S    (1.0f / POINT_RATE_HZ)
-#define MORPH_RATE_RAD_S  1.0f      // y-phase precession (~6 s per full morph)
-#define HUE_RATE_DEG_S    50.0f     // color cycling (~7.2 s per full wheel)
-#define LASER_INTENSITY   0.25f     // 25% of full scale
-#define FRAMES_PER_REBUILD 4        // rebuild the morph every N loops (~30 Hz)
+// Built-in Lissajous renderer (pattern mode). The figure's shape, size, color,
+// and morph all come from the live Art-Net control state; only the sampling
+// cadence is fixed here. Points are ILDA-signed (center 0). POINTS_PER_LOOP
+// samples close the figure for integer frequency ratios; the phase morph and the
+// frame rebuild happen only every FRAMES_PER_REBUILD displayed loops, keeping the
+// per-point trig off the hot path (cf. the sin-LUT flash-stall lesson).
+#define POINTS_PER_LOOP    256
+#define POINT_PERIOD_S     (1.0f / POINT_RATE_HZ)
+#define FRAMES_PER_REBUILD 4
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-#endif // RENDER_DEMO
 
 // ---------------------------------------------------------------------------
 // Device handles + interface args
@@ -128,14 +133,13 @@ static dacx0004_idf6_arg_t laser_arg = {
     .miso_pin   = -1,
 };
 
-#if RENDER_DEMO
 // ---------------------------------------------------------------------------
-// HSV -> 8-bit RGB (ILDA color depth), with saturation and value fixed at full
-// (S = V = 1). h is in degrees [0, 360).
+// HSV -> 8-bit RGB (ILDA color depth) at full saturation. `h` is in degrees
+// [0, 360); `value` is the beam brightness [0, 1] (the Art-Net intensity).
 // ---------------------------------------------------------------------------
-static void hsv_to_rgb8(float h, uint8_t *r, uint8_t *g, uint8_t *b)
+static void hsv_to_rgb8(float h, float value, uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    const float c  = LASER_INTENSITY;   // chroma = V * S  (V = LASER_INTENSITY, S = 1)
+    const float c  = value;             // chroma = V * S  (S = 1)
     const float hp = h / 60.0f;
     const float x  = c * (1.0f - fabsf(fmodf(hp, 2.0f) - 1.0f));
     float rf = 0.0f, gf = 0.0f, bf = 0.0f;
@@ -157,23 +161,25 @@ static void hsv_to_rgb8(float h, uint8_t *r, uint8_t *g, uint8_t *b)
 // off the critical path in build_frame at the (much lower) rebuild cadence.
 static laser_point_t s_frame[POINTS_PER_LOOP];
 
-// Evaluate the morphing Lissajous for the current phase/hue into s_frame. Called
-// once per FRAMES_PER_REBUILD displayed loops, so its sinf cost is ~30 Hz, not
-// per output point. Color is constant within a frame (the hue drift per rebuild
-// is small), which matches the old per-16-point color quantization.
-static void build_frame(float phase, float hue)
+// Evaluate the Lissajous for the current control state + morph phase into
+// s_frame. Called once per FRAMES_PER_REBUILD displayed loops, so its sinf cost
+// is ~30 Hz, not per output point. Shape (fx/fy), size, color, and phase offset
+// all come from the live Art-Net state; color is constant within a frame.
+static void build_frame(const artnet_control_state_t *st, float phase)
 {
     const float two_pi = (float)(2.0 * M_PI);
     const float t_step = two_pi / POINTS_PER_LOOP;
 
     uint8_t r, g, b;
-    hsv_to_rgb8(hue, &r, &g, &b);
+    hsv_to_rgb8(st->hue_deg, st->intensity, &r, &g, &b);
 
+    const float amp  = (float)st->amplitude;
+    const float yoff = phase + st->phase_off;
     for (int i = 0; i < POINTS_PER_LOOP; i++) {
         const float t = i * t_step;
         s_frame[i] = (laser_point_t){
-            .x      = (int16_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FX * t)),
-            .y      = (int16_t)(GALVO_AMPLITUDE * sinf(LISSAJOUS_FY * t + phase)),
+            .x      = (int16_t)(amp * sinf((float)st->fx * t)),
+            .y      = (int16_t)(amp * sinf((float)st->fy * t + yoff)),
             .status = 0,
             .r      = r,
             .g      = g,
@@ -183,72 +189,61 @@ static void build_frame(float phase, float hue)
 }
 
 // ---------------------------------------------------------------------------
-// Renderer: trace a morphing Lissajous ("ballywhoop") while slowly cycling the
-// hue. The figure is precomputed into s_frame and bulk-pushed repeatedly; the
-// morph/hue are advanced and the frame rebuilt only every FRAMES_PER_REBUILD
-// displayed loops, decoupling the cheap display path from the trig work.
+// Renderer: pick pattern vs stream from the live Art-Net control state each
+// loop. In pattern mode it traces the Lissajous from the current settings
+// (morphing the y-phase); in stream mode it loops the latest scene received over
+// TCP. Both push only from internal DRAM, keeping flash off the hot path (cf.
+// the sin-LUT stall). When no scene has arrived yet the ring drains and the
+// engine blanks — safe: galvo centered, beam dark.
 // ---------------------------------------------------------------------------
 static void render_task(void *arg)
 {
     (void)arg;
 
     const float two_pi = (float)(2.0 * M_PI);
-    float phase = 0.0f, hue = 0.0f;
-
-    build_frame(phase, hue);
+    float phase = 0.0f;
+    int   f     = 0;   // displayed-loop counter within the current rebuild cycle
 
     for (;;) {
-        // Display the current frame FRAMES_PER_REBUILD times. Each push is a bulk
-        // ring write of a DRAM buffer; retry only the tail that didn't fit.
-        for (int f = 0; f < FRAMES_PER_REBUILD; f++) {
-            uint32_t pushed = 0;
-            while (pushed < POINTS_PER_LOOP) {
-                pushed += laser_engine_points(s_frame + pushed, POINTS_PER_LOOP - pushed);
-                if (pushed < POINTS_PER_LOOP) vTaskDelay(1);   // ring full: drain
+        artnet_control_state_t st;
+        artnet_control_get(&st);
+
+        if (st.mode == ARTNET_MODE_STREAM) {
+            f = 0;   // restart pattern bookkeeping so we rebuild on return
+            const laser_point_t *pts = NULL;
+            uint32_t n = 0;
+            if (!point_stream_get(&pts, &n) || n == 0) {
+                vTaskDelay(pdMS_TO_TICKS(50));   // idle: no scene yet
+                continue;
             }
-        }
-
-        // Advance the animation by the wall-clock time those loops took, then
-        // re-evaluate the figure for the new phase/hue.
-        const float dt = FRAMES_PER_REBUILD * POINTS_PER_LOOP * POINT_PERIOD_S;
-        phase += MORPH_RATE_RAD_S * dt;
-        if (phase >= two_pi) phase -= two_pi;
-        hue += HUE_RATE_DEG_S * dt;
-        if (hue >= 360.0f) hue -= 360.0f;
-        build_frame(phase, hue);
-    }
-}
-
-#else // !RENDER_DEMO
-
-// ---------------------------------------------------------------------------
-// Renderer: loop the active streamed scene. point_stream_get hands back the
-// latest published scene (held in internal DRAM); we bulk-push it into the ring
-// on repeat. Pushing only from the DRAM scene buffer keeps flash off the hot
-// path (cf. the sin-LUT stall). Until the first scene arrives the ring drains
-// and the engine blanks — safe: galvo centered, beam dark. A new scene swaps in
-// seamlessly between whole loops.
-// ---------------------------------------------------------------------------
-static void render_task(void *arg)
-{
-    (void)arg;
-    for (;;) {
-        const laser_point_t *pts = NULL;
-        uint32_t n = 0;
-        if (!point_stream_get(&pts, &n) || n == 0) {
-            vTaskDelay(pdMS_TO_TICKS(50));   // idle: no scene yet
+            uint32_t pushed = 0;
+            while (pushed < n) {
+                pushed += laser_engine_points(pts + pushed, n - pushed);
+                if (pushed < n) vTaskDelay(1);   // ring full: let it drain
+            }
             continue;
         }
-        // Display one full loop of the scene; retry only the tail that didn't fit.
+
+        // Pattern mode: (re)build the figure from the live settings at the start
+        // of each rebuild cycle, then bulk-push it. Rebuilding every
+        // FRAMES_PER_REBUILD loops keeps the per-point trig off the hot path and
+        // still picks up fader moves within a few tens of ms.
+        if (f == 0) build_frame(&st, phase);
+
         uint32_t pushed = 0;
-        while (pushed < n) {
-            pushed += laser_engine_points(pts + pushed, n - pushed);
-            if (pushed < n) vTaskDelay(1);   // ring full: let it drain
+        while (pushed < POINTS_PER_LOOP) {
+            pushed += laser_engine_points(s_frame + pushed, POINTS_PER_LOOP - pushed);
+            if (pushed < POINTS_PER_LOOP) vTaskDelay(1);   // ring full: drain
+        }
+
+        if (++f >= FRAMES_PER_REBUILD) {
+            f = 0;
+            const float dt = FRAMES_PER_REBUILD * POINTS_PER_LOOP * POINT_PERIOD_S;
+            phase += st.morph_rate * dt;
+            while (phase >= two_pi) phase -= two_pi;
         }
     }
 }
-
-#endif // RENDER_DEMO
 
 // Low-priority watchdog on producer health: log the engine's underrun count
 // once a second. A rising delta means render_task can't keep the ring full at
@@ -268,10 +263,10 @@ static void underrun_log_task(void *arg)
 
 void app_main(void)
 {
-    #if ENABLE_WIFI
-    // -- Networking: bring up WiFi for streaming. Owns NVS / netif / event loop,
-    //    so start it first. STA joins "ioio" (IP logged on join); AP hosts our
-    //    own network. ----------------------------------------------------------
+    #if ENABLE_NET
+    // -- Networking: bring up WiFi for streaming + Art-Net control. Owns NVS /
+    //    netif / event loop, so start it first. STA joins "ioio" (IP logged on
+    //    join); AP hosts our own network. ----------------------------------------
     #if WIFI_STA_MODE
     if (!wifi_sta_start()) {
         ESP_LOGE(TAG, "wifi_sta_start failed");  // non-fatal: keep tracing
@@ -348,12 +343,24 @@ void app_main(void)
     laser_engine_start();
     ESP_LOGI(TAG, "laser engine started");
 
-#if !RENDER_DEMO
-    // -- Scene streaming: triple-buffered DRAM scene store + TCP receiver. The
-    //    renderer loops the latest published scene. ----------------------------
+    // -- Control + scene stores. Seed both unconditionally so the renderer always
+    //    has valid state to read; the network receivers below depend on WiFi. The
+    //    renderer chooses pattern vs stream at runtime from the Art-Net control
+    //    state, which holds the offline Lissajous defaults until a console (or
+    //    tools/artnetctl) says otherwise. --------------------------------------
+    artnet_control_state_t defaults;
+    artnet_control_defaults(&defaults);
+    artnet_control_init(&defaults, ARTNET_UNIVERSE, ARTNET_BASE_CHANNEL);
     point_stream_init();
+
+#if ENABLE_NET
+    // Scene streaming: triple-buffered DRAM scene store + TCP receiver.
     if (!point_stream_start(SCENE_TCP_PORT)) {
         ESP_LOGE(TAG, "point_stream_start failed");  // non-fatal: renderer idles
+    }
+    // Art-Net control receiver: maps DMX -> mode + Lissajous settings.
+    if (!artnet_control_start()) {
+        ESP_LOGE(TAG, "artnet_control_start failed");  // non-fatal: defaults hold
     }
 #endif
 

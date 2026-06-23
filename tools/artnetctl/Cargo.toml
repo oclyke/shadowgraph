@@ -1,0 +1,12 @@
+[package]
+name = "artnetctl"
+version = "0.1.0"
+edition = "2021"
+description = "Drive the shadowgraph laser over Art-Net: mode toggle + Lissajous settings"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+
+[[bin]]
+name = "artnetctl"
+path = "src/main.rs"
